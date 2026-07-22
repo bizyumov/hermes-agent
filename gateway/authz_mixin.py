@@ -200,6 +200,44 @@ def _principal_matches_allowlist(source, user_id: str, allowed_ids: set) -> bool
     return bool(check_ids & allowed_ids)
 
 
+def _telegram_config_authorizes_source(source: SessionSource, extra: object) -> Optional[bool]:
+    """Apply Telegram's config allowlists with their documented scopes.
+
+    ``allow_from`` applies in every chat type; ``group_allow_from`` and
+    ``group_allowed_chats`` only add grants for group-like sources.  Returning
+    ``None`` distinguishes a source with no non-empty applicable config
+    allowlist from a sender that was explicitly rejected by one. Empty lists
+    are common config defaults and contribute neither a grant nor a rejection.
+    """
+    if not isinstance(extra, dict):
+        return None
+
+    user_id = str(source.user_id or "").strip()
+    global_allowed = _coerce_allow_set(extra.get("allow_from"))
+    applicable_allowlists = [global_allowed]
+
+    if source.chat_type in {"group", "forum", "channel"}:
+        group_users = _coerce_allow_set(extra.get("group_allow_from"))
+        group_chats = _coerce_allow_set(extra.get("group_allowed_chats"))
+        applicable_allowlists.extend((group_users, group_chats))
+
+    if not any(applicable_allowlists):
+        return None
+
+    if user_id and ("*" in global_allowed or user_id in global_allowed):
+        return True
+
+    if source.chat_type in {"group", "forum", "channel"}:
+        if user_id and ("*" in group_users or user_id in group_users):
+            return True
+
+        chat_id = str(source.chat_id or "").strip()
+        if chat_id and ("*" in group_chats or chat_id in group_chats):
+            return True
+
+    return False
+
+
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
 
@@ -508,6 +546,19 @@ class GatewayAuthorizationMixin:
         if pairing_store is not None and pairing_store.is_approved(source.platform.value if source.platform else "", user_id):
             return True
 
+        # Telegram config allowlists are grants in the same union as pairing
+        # and environment allowlists. Evaluate them before the env-only branch
+        # so mixed YAML/environment configurations cannot hide a config grant.
+        if source.platform == Platform.TELEGRAM:
+            try:
+                adapter = self._adapter_for_source(source)
+                if adapter is not None:
+                    extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+                    if _telegram_config_authorizes_source(source, extra) is True:
+                        return True
+            except Exception:
+                pass
+
         platform_allowlist = _auth_env(platform_allow_env)
         group_user_allowlist = _auth_env(_GROUP_USER_ENV.get(source.platform, "")) if is_group_or_forum else ""
         group_chat_allowlist = _auth_env(_GROUP_CHAT_ENV.get(source.platform, "")) if is_group_or_forum else ""
@@ -519,7 +570,7 @@ class GatewayAuthorizationMixin:
                 verdict = self._own_policy_authorizes(source, user_id, is_group, adapter_profile)
                 if verdict is not None:
                     return verdict
-            if self._adapter_extra_allowlist_authorizes(source, user_id, is_group):
+            if source.platform != Platform.TELEGRAM and self._adapter_extra_allowlist_authorizes(source, user_id, is_group):
                 return True
             return _env_truthy("GATEWAY_ALLOW_ALL_USERS")
 

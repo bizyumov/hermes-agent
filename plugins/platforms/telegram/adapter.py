@@ -139,7 +139,7 @@ import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
-from gateway.authz_mixin import _coerce_allow_set
+from gateway.authz_mixin import _telegram_config_authorizes_source
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter, SendResult, classify_send_error,
@@ -864,15 +864,20 @@ class TelegramAdapter(BasePlatformAdapter):
         # No identity → service message or channel post without sender_chat; defer to message gating.
         if not user_id:
             return True
+
+        # Config allowlists use the same union as runner authorization: global
+        # users work everywhere, while group users and allowed group chats add
+        # scoped grants without widening direct-message access.
+        config_authorized = _telegram_config_authorizes_source(source, self.config.extra)
+        if config_authorized is True:
+            return True
+
         authorized: Optional[bool] = None
-        # Adapter-level allow_from (DMs) / group_allow_from (groups) are the sole authority if set.
-        adapter_allow_from = self.config.extra.get(
-            "group_allow_from" if (source.chat_type or "") in ("group", "forum", "channel") else "allow_from")
-        if adapter_allow_from is not None:
-            allowed = _coerce_allow_set(adapter_allow_from)
-            authorized = user_id in allowed or "*" in allowed
-        # Instance-level override only (tests): the class method _is_callback_user_authorized is for
-        # inline buttons and must not become a user-id-only shortcut for real messages.
+
+        # Test/custom injection only. The class method named
+        # _is_callback_user_authorized is for inline button callbacks and must
+        # not be treated as a user-id-only shortcut for real messages — only
+        # honor an instance-level override (set in tests).
         if authorized is None:
             callback_auth = self.__dict__.get("_is_callback_user_authorized")
             if callable(callback_auth):
@@ -887,7 +892,7 @@ class TelegramAdapter(BasePlatformAdapter):
             has_callback = getattr(self, "_authorization_check", None) is not None
             if has_callback or auth_fn is not None:
                 # No allowlist → unknown DMs must reach pairing, not be default-denied here.
-                if not self._telegram_auth_env_configured():
+                if config_authorized is None and not self._telegram_auth_env_configured():
                     return True
                 decision = self._is_sender_authorized(
                     user_id, chat_type=source.chat_type, chat_id=source.chat_id, is_bot=source.is_bot,
@@ -900,9 +905,47 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception:
                         logger.debug("[Telegram] Falling back to env-only auth for user %s", user_id, exc_info=True)
         if authorized is None:
-            authorized = self._env_allowlist_decision(user_id)
-            if authorized is None:
+            if _scoped_gate_env("TELEGRAM_ALLOW_ALL_USERS").lower().strip() in {
+                "true",
+                "1",
+                "yes",
+            }:
                 return True
+            if _scoped_gate_env("GATEWAY_ALLOW_ALL_USERS").lower().strip() in {
+                "true",
+                "1",
+                "yes",
+            }:
+                return True
+
+            # Bare adapters have no runner to combine config and environment
+            # grants. Apply the same scoped union locally as a safe fallback.
+            env_authorized = _telegram_config_authorizes_source(
+                source,
+                {
+                    "allow_from": ",".join(
+                        value
+                        for value in (
+                            _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip(),
+                            _scoped_gate_env("GATEWAY_ALLOWED_USERS").strip(),
+                        )
+                        if value
+                    ),
+                    "group_allow_from": _scoped_gate_env(
+                        "TELEGRAM_GROUP_ALLOWED_USERS"
+                    ).strip(),
+                    "group_allowed_chats": _scoped_gate_env(
+                        "TELEGRAM_GROUP_ALLOWED_CHATS"
+                    ).strip(),
+                },
+            )
+            if env_authorized is True:
+                return True
+            if config_authorized is False or env_authorized is False:
+                authorized = False
+            else:
+                return True
+
         if authorized:
             return True
         # Unauthorized DM the gateway would pair: forward so pairing can run.
