@@ -506,6 +506,43 @@ def test_registered_gateway_authority_preserves_pairing_union(monkeypatch):
     assert adapter._is_user_authorized_from_message(msg) is True
 
 
+def test_profile_route_selects_scoped_authority_before_default_callback(monkeypatch):
+    """Shared credentials must authorize against the chat's routed profile."""
+    for key in (
+        "TELEGRAM_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_CHATS",
+        "TELEGRAM_ALLOW_ALL_USERS",
+        "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    seen = []
+
+    class Runner:
+        @staticmethod
+        def _profile_name_for_source(_source):
+            return "routed-profile"
+
+        @staticmethod
+        def _is_user_authorized_for_adapter_intake(source):
+            seen.append(source)
+            return source.profile == "routed-profile" and source.user_id == "paired-user"
+
+    adapter = _make_adapter(allow_from=["owner"])
+    adapter.gateway_runner = Runner()
+    adapter.set_authorization_check(lambda *_args: False)
+    message = _make_message(
+        from_user_id="paired-user",
+        chat_id=-100,
+        chat_type="group",
+    )
+
+    assert adapter._is_user_authorized_from_message(message) is True
+    assert seen and seen[0].profile == "routed-profile"
+
+
 def test_profile_secret_scope_restriction_is_enforced_at_intake(monkeypatch):
     """Multiplex profile allowlists must gate before event construction."""
     from agent.secret_scope import reset_secret_scope, set_secret_scope

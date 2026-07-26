@@ -241,6 +241,17 @@ def _telegram_config_authorizes_source(source: SessionSource, extra: object) -> 
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
 
+    def _is_user_authorized_for_adapter_intake(self, source: SessionSource) -> bool:
+        """Run an adapter's early auth check under the routed profile scope."""
+        config = getattr(self, "config", None)
+        if getattr(config, "multiplex_profiles", False):
+            from gateway.run import _profile_runtime_scope
+
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return self._is_user_authorized(source)
+        return self._is_user_authorized(source)
+
     # ``getattr(self, ...)`` throughout: test helpers build bare runners via ``object.__new__``
     # without ``adapters`` / ``config``.
 

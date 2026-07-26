@@ -806,9 +806,21 @@ class TelegramAdapter(BasePlatformAdapter):
         if thread_id_raw is not None and (
             (chat_type == "forum" and (is_topic_message or is_forum_group)) or (chat_type == "dm" and is_topic_message)):
             thread_id = str(thread_id_raw)
-        return SessionSource(
+        source = SessionSource(
             platform=Platform.TELEGRAM, chat_id=chat_id or "", chat_type=chat_type, user_id=user_id,
             user_name=user_name, thread_id=thread_id, is_bot=is_bot)
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None:
+            try:
+                source.profile = runner._profile_name_for_source(source)
+            except Exception:
+                logger.debug(
+                    "[Telegram] Profile routing failed during intake auth",
+                    exc_info=True,
+                )
+        if not source.profile:
+            source.profile = getattr(self, "_gateway_profile_name", None)
+        return source
 
     def _source_from_reaction_for_auth(self, update):
         """SessionSource for a ``message_reaction`` update's actor (``user`` or ``actor_chat``).
@@ -904,6 +916,24 @@ class TelegramAdapter(BasePlatformAdapter):
                     authorized = bool(callback_auth(
                         user_id, chat_id=source.chat_id, chat_type=source.chat_type, thread_id=source.thread_id,
                         user_name=source.user_name))
+        auth_is_configured = (
+            config_authorized is not None or self._telegram_auth_env_configured()
+        )
+
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        intake_auth = getattr(runner, "_is_user_authorized_for_adapter_intake", None)
+        if authorized is None and callable(intake_auth) and auth_is_configured:
+            try:
+                authorized = bool(intake_auth(source))
+            except Exception:
+                logger.debug(
+                    "[Telegram] Falling back after scoped auth failed for user %s",
+                    user_id,
+                    exc_info=True,
+                )
+
         if authorized is None:
             # Runner's full auth chain; prefer the set_authorization_check callback (survives multiplex
             # handler wrapping, unlike bound-handler __self__).
