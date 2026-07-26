@@ -539,6 +539,35 @@ def test_profile_secret_scope_restriction_is_enforced_at_intake(monkeypatch):
     assert seen == [("attacker", "group", "-100")]
 
 
+def test_profile_secret_scope_authorizes_identityless_allowed_chat(monkeypatch):
+    """Anonymous profile traffic must use the scoped chat list, not global env."""
+    from agent.secret_scope import (
+        is_multiplex_active,
+        reset_secret_scope,
+        set_multiplex_active,
+        set_secret_scope,
+    )
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-200")
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-100",
+        chat_type="channel",
+        user_id=None,
+    )
+    previous_multiplex_state = is_multiplex_active()
+    set_multiplex_active(True)
+    token = set_secret_scope({"TELEGRAM_GROUP_ALLOWED_CHATS": "-100"})
+    try:
+        assert runner._is_user_authorized(source) is True
+    finally:
+        reset_secret_scope(token)
+        set_multiplex_active(previous_multiplex_state)
+
+
 @pytest.mark.parametrize(
     ("env_name", "env_value", "from_user_id", "chat_id"),
     (
