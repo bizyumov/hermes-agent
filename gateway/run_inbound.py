@@ -80,7 +80,7 @@ class GatewayInboundMixin:
         platform_name = source.platform.value if source.platform else "unknown"
         pairing_store = self._pairing_store_for(source)
         if pairing_store is None:
-            logger.error("Cannot offer pairing code on %s: no pairing store", platform_name)
+            logger.error("No pairing store available for %s profile=%s", platform_name, source.profile or "default")
             return
         # Rate-limit ALL pairing responses (code or rejection) so a burst of DMs doesn't spam.
         if pairing_store._is_rate_limited(platform_name, source.user_id):
