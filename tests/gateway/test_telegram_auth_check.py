@@ -144,6 +144,51 @@ def test_is_user_authorized_from_message_allow_from():
     assert adapter._is_user_authorized_from_message(msg) is False
 
 
+@pytest.mark.parametrize("forum", [False, True])
+def test_global_allow_from_remains_a_grant_in_group_context(forum):
+    """The platform-wide list is ORed with group-only sender grants."""
+    adapter = _make_adapter(
+        allow_from=["111"],
+        group_allow_from=["222"],
+    )
+    msg = _make_message(from_user_id=111, chat_id=-100, chat_type="supergroup")
+    if forum:
+        msg.chat.is_forum = True
+        msg.is_topic_message = True
+        msg.message_thread_id = 7
+
+    assert adapter._is_user_authorized_from_message(msg) is True
+
+
+@pytest.mark.parametrize("forum", [False, True])
+def test_group_allowed_chat_is_ored_with_group_sender_list(forum):
+    """A listed chat authorizes every member even when a sender list exists."""
+    adapter = _make_adapter(
+        group_allow_from=["222"],
+        group_allowed_chats=["-100"],
+    )
+    msg = _make_message(from_user_id=111, chat_id=-100, chat_type="supergroup")
+    if forum:
+        msg.chat.is_forum = True
+        msg.is_topic_message = True
+        msg.message_thread_id = 7
+
+    assert adapter._is_user_authorized_from_message(msg) is True
+
+
+def test_empty_group_config_lists_defer_to_injected_authority():
+    """Empty YAML defaults must not become a sole-authority rejection."""
+    adapter = _make_adapter(
+        group_allow_from=[],
+        group_allowed_chats=[],
+        callback_auth=lambda uid, **_kw: uid == "111",
+    )
+
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=111, chat_id=-100, chat_type="group")
+    ) is True
+
+
 def test_allowlist_dm_with_explicit_pair_behavior_reaches_gateway(monkeypatch):
     """Allowlist + unauthorized_dm_behavior:pair must not early-drop unknown DMs.
 
