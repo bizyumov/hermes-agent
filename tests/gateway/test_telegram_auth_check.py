@@ -71,6 +71,19 @@ def _make_message(text="hello", *, from_user_id=111, chat_id=-100, chat_type="gr
     )
 
 
+def test_partially_initialized_adapter_preserves_identityless_cold_path():
+    """Pre-initialization media gates must not require ``adapter.platform``."""
+    try:
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+    except ModuleNotFoundError:  # PR branch before Telegram plugin extraction
+        from gateway.platforms.telegram import TelegramAdapter
+
+    adapter = object.__new__(TelegramAdapter)
+    message = SimpleNamespace(from_user=None, sender_chat=None, chat=None)
+
+    assert adapter._is_user_authorized_from_message(message) is True
+
+
 @pytest.mark.asyncio
 async def test_unauthorized_user_blocked_before_event_building():
     """Unauthorized user's message should be blocked before _build_message_event."""
