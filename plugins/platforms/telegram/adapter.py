@@ -831,10 +831,29 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id=chat_id, chat_type=chat_type, user_id=user_id, user_name=user_name, thread_id=None, message_id=str(message_id))
 
     def _telegram_auth_env_configured(self) -> bool:
-        """Return True when Telegram auth env vars make an early decision safe."""
+        """Return True when profile-scoped auth vars make an early decision safe."""
         keys = (
-            "TELEGRAM_ALLOWED_USERS", "TELEGRAM_GROUP_ALLOWED_USERS", "TELEGRAM_GROUP_ALLOWED_CHATS",
-            "TELEGRAM_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS")
+            "TELEGRAM_ALLOWED_USERS",
+            "TELEGRAM_GROUP_ALLOWED_USERS",
+            "TELEGRAM_GROUP_ALLOWED_CHATS",
+            "TELEGRAM_ALLOW_ALL_USERS",
+            "GATEWAY_ALLOWED_USERS",
+            "GATEWAY_ALLOW_ALL_USERS",
+        )
+        # A profile-bound callback may be exercised under an installed secret
+        # scope before multiplex startup has flipped its process-wide marker.
+        # Treat values in that explicit scope as configured without allowing a
+        # missing scoped key to fall through to another profile's process env.
+        try:
+            from agent.secret_scope import current_secret_scope
+
+            scope = current_secret_scope()
+            if scope is not None and any(
+                str(scope.get(key) or "").strip() for key in keys
+            ):
+                return True
+        except Exception:
+            pass
         return any(_scoped_gate_env(key).strip() for key in keys)
 
     def _should_pass_unauthorized_dm_for_pairing(self, source) -> bool:

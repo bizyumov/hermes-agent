@@ -560,8 +560,8 @@ class GatewayAuthorizationMixin:
                 pass
 
         platform_allowlist = _auth_env(platform_allow_env)
-        group_user_allowlist = _auth_env(_GROUP_USER_ENV.get(source.platform, "")) if is_group_or_forum else ""
-        group_chat_allowlist = _auth_env(_GROUP_CHAT_ENV.get(source.platform, "")) if is_group_or_forum else ""
+        group_user_allowlist = _auth_env(_GROUP_USER_ENV.get(source.platform, "")) if is_group else ""
+        group_chat_allowlist = _auth_env(_GROUP_CHAT_ENV.get(source.platform, "")) if is_group else ""
         global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
 
         if not (platform_allowlist or group_user_allowlist or group_chat_allowlist or global_allowlist):
@@ -574,7 +574,7 @@ class GatewayAuthorizationMixin:
                 return True
             return _env_truthy("GATEWAY_ALLOW_ALL_USERS")
 
-        if is_group_or_forum and source.chat_id:
+        if is_group and source.chat_id:
             # Telegram group traffic authorized by chat ID (TELEGRAM_GROUP_ALLOWED_USERS gates the sender).
             if group_chat_allowlist and _allows(_coerce_allow_set(group_chat_allowlist), source.chat_id):
                 return True
