@@ -268,6 +268,94 @@ def test_runner_config_authorization_matches_telegram_intake_union(monkeypatch):
     assert config_intake == env_intake
 
 
+@pytest.mark.parametrize(
+    ("env_name", "env_value", "message"),
+    (
+        (
+            "TELEGRAM_GROUP_ALLOWED_USERS",
+            "group-user",
+            _make_message(from_user_id="group-user", chat_id=-200, chat_type="group"),
+        ),
+        (
+            "TELEGRAM_GROUP_ALLOWED_CHATS",
+            "-100",
+            _make_message(from_user_id="unlisted-user", chat_id=-100, chat_type="group"),
+        ),
+    ),
+)
+def test_mixed_yaml_and_environment_group_grants_are_unioned(
+    monkeypatch,
+    env_name,
+    env_value,
+    message,
+):
+    """A non-matching YAML global list must not hide an env group grant."""
+    from gateway.run import GatewayRunner
+
+    for key in (
+        "TELEGRAM_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_CHATS",
+        "TELEGRAM_ALLOW_ALL_USERS",
+        "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(env_name, env_value)
+
+    adapter = _make_adapter(
+        allow_from=["global-user"],
+        group_allow_from=[],
+        group_allowed_chats=[],
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = False
+    adapter._message_handler = runner._is_user_authorized
+
+    assert adapter._is_user_authorized_from_message(message) is True
+    assert runner._is_user_authorized(adapter._source_from_message_for_auth(message)) is True
+
+
+def test_scalar_config_allowlists_match_sequence_semantics():
+    """Comma-separated YAML scalars use the same scoped union as sequences."""
+    adapter = _make_adapter(
+        allow_from="111, 222",
+        group_allow_from="333, 444",
+        group_allowed_chats="-100, -200",
+    )
+
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=222, chat_id=-300, chat_type="group")
+    ) is True
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=444, chat_id=-300, chat_type="group")
+    ) is True
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=555, chat_id=-200, chat_type="group")
+    ) is True
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    (
+        (
+            {"group_allow_from": ["*"]},
+            _make_message(from_user_id=111, chat_id=-300, chat_type="group"),
+        ),
+        (
+            {"group_allowed_chats": ["*"]},
+            _make_message(from_user_id=111, chat_id=-300, chat_type="group"),
+        ),
+    ),
+)
+def test_group_scoped_wildcards_authorize(extra, message):
+    adapter = _make_adapter(**extra)
+
+    assert adapter._is_user_authorized_from_message(message) is True
+
+
 def test_allowlist_dm_with_explicit_pair_behavior_reaches_gateway(monkeypatch):
     """Allowlist + unauthorized_dm_behavior:pair must not early-drop unknown DMs.
 
