@@ -526,7 +526,7 @@ def test_profile_route_selects_scoped_authority_before_default_callback(monkeypa
             return "routed-profile"
 
         @staticmethod
-        def _is_user_authorized_for_adapter_intake(source):
+        def _adapter_intake_authorization_decision(source, *, config_authorized=None):
             seen.append(source)
             return source.profile == "routed-profile" and source.user_id == "paired-user"
 
@@ -541,6 +541,38 @@ def test_profile_route_selects_scoped_authority_before_default_callback(monkeypa
 
     assert adapter._is_user_authorized_from_message(message) is True
     assert seen and seen[0].profile == "routed-profile"
+    assert seen[0]._transport_adapter_ref() is adapter
+
+
+def test_routed_profile_restriction_is_checked_before_early_pass(monkeypatch):
+    """A routed profile's env restriction must not pass intake as unconfigured."""
+    for key in (
+        "TELEGRAM_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_CHATS",
+        "TELEGRAM_ALLOW_ALL_USERS",
+        "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    class Runner:
+        @staticmethod
+        def _profile_name_for_source(_source):
+            return "restricted-profile"
+
+        @staticmethod
+        def _adapter_intake_authorization_decision(source, *, config_authorized=None):
+            assert source.profile == "restricted-profile"
+            assert config_authorized is None
+            return False
+
+    adapter = _make_adapter()
+    adapter.gateway_runner = Runner()
+
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id="attacker", chat_id=-100, chat_type="group")
+    ) is False
 
 
 def test_profile_secret_scope_restriction_is_enforced_at_intake(monkeypatch):

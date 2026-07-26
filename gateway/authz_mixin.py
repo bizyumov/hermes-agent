@@ -241,16 +241,37 @@ def _telegram_config_authorizes_source(source: SessionSource, extra: object) -> 
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
 
-    def _is_user_authorized_for_adapter_intake(self, source: SessionSource) -> bool:
-        """Run an adapter's early auth check under the routed profile scope."""
+    def _adapter_intake_authorization_decision(
+        self,
+        source: SessionSource,
+        *,
+        config_authorized: Optional[bool] = None,
+    ) -> Optional[bool]:
+        """Return a scoped early-auth decision, or ``None`` to preserve pairing."""
+        def decide() -> Optional[bool]:
+            if source.platform == Platform.TELEGRAM:
+                keys = (
+                    "TELEGRAM_ALLOWED_USERS",
+                    "TELEGRAM_GROUP_ALLOWED_USERS",
+                    "TELEGRAM_GROUP_ALLOWED_CHATS",
+                    "TELEGRAM_ALLOW_ALL_USERS",
+                    "GATEWAY_ALLOWED_USERS",
+                    "GATEWAY_ALLOW_ALL_USERS",
+                )
+                if config_authorized is None and not any(
+                    _platform_gate_env(key) for key in keys
+                ):
+                    return None
+            return self._is_user_authorized(source)
+
         config = getattr(self, "config", None)
         if getattr(config, "multiplex_profiles", False):
             from gateway.run import _profile_runtime_scope
 
             profile_home = self._resolve_profile_home_for_source(source)
             with _profile_runtime_scope(profile_home):
-                return self._is_user_authorized(source)
-        return self._is_user_authorized(source)
+                return decide()
+        return decide()
 
     # ``getattr(self, ...)`` throughout: test helpers build bare runners via ``object.__new__``
     # without ``adapters`` / ``config``.
