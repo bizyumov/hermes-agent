@@ -588,6 +588,49 @@ def test_routed_profile_restriction_is_checked_before_early_pass(monkeypatch):
     ) is False
 
 
+def test_routed_profile_pairing_decision_does_not_resume_global_fallback(monkeypatch):
+    """A scoped ``None`` decision must preserve pairing without cross-profile auth."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "default-profile-owner")
+    fallback_calls = []
+
+    class Runner:
+        @staticmethod
+        def _profile_name_for_source(_source):
+            return "pairing-profile"
+
+        @staticmethod
+        def _adapter_intake_authorization_decision(source, *, config_authorized=None):
+            assert source.profile == "pairing-profile"
+            assert config_authorized is None
+            return None
+
+    adapter = _make_adapter()
+    adapter.gateway_runner = Runner()
+    adapter.set_authorization_check(
+        lambda *_args: fallback_calls.append("default-profile") or False
+    )
+
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id="new-user", chat_id="new-user", chat_type="private")
+    ) is True
+    assert fallback_calls == []
+
+
+def test_unscoped_multiplex_auth_env_does_not_leak_process_global(monkeypatch):
+    """Unscoped multiplex auth reads must honor secret-scope fail-closed behavior."""
+    from agent import secret_scope
+    from gateway.authz_mixin import _auth_env
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "default-profile-owner")
+    token = secret_scope.set_secret_scope(None)
+    secret_scope.set_multiplex_active(True)
+    try:
+        assert _auth_env("TELEGRAM_ALLOWED_USERS") == ""
+    finally:
+        secret_scope.set_multiplex_active(False)
+        secret_scope.reset_secret_scope(token)
+
+
 def test_profile_secret_scope_restriction_is_enforced_at_intake(monkeypatch):
     """Multiplex profile allowlists must gate before event construction."""
     from agent.secret_scope import reset_secret_scope, set_secret_scope

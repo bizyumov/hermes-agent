@@ -41,30 +41,34 @@ _ALLOW_BOTS_ENV = {
 }
 
 
-def _platform_gate_env(name: str, default: str = "") -> str:
-    """Read an allow/deny gate env var with per-profile isolation.
-
-    With a profile secret scope installed AND multiplexing active, a scoped miss returns ``default``
-    instead of falling through to ``os.environ``, which may hold ANOTHER profile's first-writer
-    bridged value (allowlist leak). Single-profile deployments behave exactly like ``os.getenv``.
-
-    Under multiplex the process env may hold ANOTHER profile's first-writer-bridged value (the YAML→env
-    bridges in the Discord/Telegram adapters' ``_apply_yaml_config`` are first-writer-wins), so falling
-    through would leak profile A's allowlist into profile B (issue #72348).
-    """
+def _auth_env(name: str, default: str = "") -> str:
+    """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
     if not name:
         return default
-    with contextlib.suppress(Exception):
-        from agent.secret_scope import current_secret_scope, is_multiplex_active
+    try:
+        from agent.secret_scope import UnscopedSecretError, get_secret
+    except Exception:
+        return (os.getenv(name) or default).strip()
 
-        scope = current_secret_scope()
-        if scope is not None and is_multiplex_active():
-            val = scope.get(name)
-            return default if val is None else str(val).strip()
+    try:
+        val = get_secret(name)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    except UnscopedSecretError:
+        # Multiplex mode intentionally rejects unscoped credential reads. Do
+        # not defeat that isolation boundary by falling through to another
+        # profile's process-global environment.
+        return default
+    except Exception:
+        pass
     return (os.getenv(name) or default).strip()
 
 
-_auth_env = _platform_gate_env
+def _platform_gate_env(name: str, default: str = "") -> str:
+    """Read platform gates with the same strict profile isolation as authorization."""
+    return _auth_env(name, default)
+
+
 
 
 def _env_truthy(name: str) -> bool:

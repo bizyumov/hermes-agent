@@ -938,8 +938,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     source,
                     config_authorized=config_authorized,
                 )
-                if intake_decision is not None:
-                    authorized = bool(intake_decision)
+                # ``None`` is the scoped runner's explicit instruction to
+                # preserve the pairing path. It is terminal: continuing here
+                # would evaluate fallback auth outside the routed profile's
+                # runtime scope and could consult another profile's state.
+                if intake_decision is None:
+                    return True
+                authorized = bool(intake_decision)
             except Exception:
                 logger.debug(
                     "[Telegram] Falling back after scoped auth failed for user %s",
