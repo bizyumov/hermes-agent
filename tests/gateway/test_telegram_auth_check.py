@@ -823,9 +823,9 @@ def test_group_allowlist_authorized_under_multiplex_closure_handler(monkeypatch)
     assert adapter._is_user_authorized_from_message(denied) is False
 
 
-def test_multiplex_closure_handler_without_callback_falls_back_to_env(monkeypatch):
+def test_multiplex_closure_handler_without_callback_uses_authorization_union(monkeypatch):
     """No registered callback + a closure handler (no runner) must not raise and
-    falls back to env-only auth — the getattr guard keeps the legacy path safe."""
+    uses the config/environment authorization union without a runner callback."""
     monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-100123")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
 
@@ -838,4 +838,8 @@ def test_multiplex_closure_handler_without_callback_falls_back_to_env(monkeypatc
     ) is True
     assert adapter._is_user_authorized_from_message(
         _make_message(from_user_id=555, chat_id=-100123, chat_type="group")
+    ) is True
+
+    assert adapter._is_user_authorized_from_message(
+        _make_message(from_user_id=555, chat_id=-100999, chat_type="group")
     ) is False
