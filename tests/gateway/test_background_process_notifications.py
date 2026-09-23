@@ -323,6 +323,36 @@ async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkey
 
 
 @pytest.mark.asyncio
+async def test_delayed_heartbeats_only_wake_running_processes(monkeypatch, tmp_path):
+    import tools.process_registry as registry_module
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    sessions = {
+        "finished": SimpleNamespace(exited=True),
+        "running": SimpleNamespace(exited=False),
+    }
+    monkeypatch.setattr(
+        registry_module, "process_registry",
+        SimpleNamespace(get=lambda session_id: sessions.get(session_id)),
+    )
+    completion_queue = queue.Queue()
+    for session_id in ("finished", "missing", "running"):
+        completion_queue.put({"type": "heartbeat", "session_id": session_id})
+    watch_event = _watch_event("independent")
+    completion_queue.put(watch_event)
+    async_event = {"type": "async_delegation", "session_id": "delegate_one"}
+    completion_queue.put(async_event)
+
+    await runner._drain_watch_notifications(completion_queue)
+
+    delivered = [call.args[1] for call in runner._inject_watch_notification.await_args_list]
+    assert [event["session_id"] for event in delivered] == ["running", "independent"]
+    assert completion_queue.qsize() == 1
+    assert completion_queue.get_nowait() is async_event
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

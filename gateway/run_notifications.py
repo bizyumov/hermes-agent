@@ -1172,9 +1172,16 @@ class GatewayNotificationsMixin:
         See #9290.
         """
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
+        from tools.process_registry import process_registry
         watch_events = _drain_gateway_watch_events(completion_queue)
         for evt in watch_events:
             async with self._completion_event_scope(evt):
+                if evt.get("type") == "heartbeat":
+                    # A slow or busy adapter can drain a running-process heartbeat long
+                    # after its process has exited. It is no longer a status update.
+                    session = process_registry.get(evt.get("session_id"))
+                    if session is None or session.exited:
+                        continue
                 if self._load_background_notifications_mode() == "off":
                     continue
                 synth_text = _format_gateway_process_notification(evt)
