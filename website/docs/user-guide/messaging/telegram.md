@@ -1107,10 +1107,12 @@ When enabled, Hermes attaches Telegram's `LinkPreviewOptions(is_disabled=True)` 
 
 ## Group Allowlisting
 
-Telegram groups and forum chats have two orthogonal gates you can configure:
+Personal grants (`allow_from` / `TELEGRAM_ALLOWED_USERS`, `GATEWAY_ALLOWED_USERS`, or an approved pairing in the same profile) authorize the sender in DMs, groups, forums and channels. A group restriction never cancels a personal grant.
 
-- **Sender user IDs** (`group_allow_from` / `TELEGRAM_GROUP_ALLOWED_USERS`) — sender-scoped allowlist that applies only to group/forum messages. Use this when you want specific users to be able to invoke the bot in groups without adding them to `TELEGRAM_ALLOWED_USERS` (which would also give them DM access).
-- **Chat IDs** (`group_allowed_chats` / `TELEGRAM_GROUP_ALLOWED_CHATS`) — chat-scoped allowlist. Any member of these groups/forums can interact with the bot. Useful for team/support bots where group membership itself is the access signal.
+For senders without a personal grant, configure group access with:
+
+- **Sender user IDs** (`group_allow_from` / `TELEGRAM_GROUP_ALLOWED_USERS`) — identifies who may invoke the bot in group-like chats without receiving DM access. When a group chat list is configured, both the sender and chat must match.
+- **Chat IDs** (`group_allowed_chats` / `TELEGRAM_GROUP_ALLOWED_CHATS`) — restricts group-only access to these chats. Set `group_allow_from: ["*"]` to admit every identified member of the listed chats. A chat entry alone does not grant access.
 
 ```yaml
 gateway:
@@ -1123,7 +1125,7 @@ gateway:
         # Sender IDs allowed in groups/forums only. Does NOT grant DM access.
         group_allow_from:
           - "987654321"
-        # Entire groups/forums — any member is authorized.
+        # Group-only senders above may interact in these groups/forums.
         group_allowed_chats:
           - "-1001234567890"
 ```
@@ -1138,10 +1140,10 @@ TELEGRAM_GROUP_ALLOWED_CHATS="-1001234567890"
 
 Behavior:
 
-- `TELEGRAM_ALLOWED_USERS` covers all chat types (DMs, groups, forums).
-- `TELEGRAM_GROUP_ALLOWED_USERS` only authorizes the listed senders in groups/forums. They still can't DM the bot unless listed in `TELEGRAM_ALLOWED_USERS`.
-- A chat in `TELEGRAM_GROUP_ALLOWED_CHATS` authorizes every member of that chat, regardless of sender.
-- Use `*` in any of these to allow any sender/chat.
+- A personal grant covers all chat types, including an unlisted group and a listed group whose sender list does not contain that person.
+- Group-only sender grants apply only in group-like chats and must also match the group chat list when configured. They never grant DM access.
+- A listed group requires a matching group sender grant or the explicit group-sender wildcard. Unknown senders remain denied.
+- A group-sender wildcard remains limited to listed chats when a group chat list is configured. A personal wildcard is a global grant; configure it only when that is intended.
 - This layers on top of existing mention/pattern triggers and on top of `group_topics` + `ignored_threads`.
 
 ### Migration from before PR #17686
@@ -1158,7 +1160,7 @@ TELEGRAM_GROUP_ALLOWED_CHATS="-1001234567890"
 
 ### Guest @mention bypass (`guest_mode`)
 
-In a typical setup, `group_allowed_chats` is a hard gate: messages from groups outside the list are silently dropped, even if a member explicitly @mentions the bot. That's the right default for support / team bots.
+`allowed_chats` controls where an already-authorized sender can trigger a reply. With `guest_mode`, an explicit @mention can cross that response-location filter. It does not grant access to an unauthorized sender or bypass the group-only authorization policy.
 
 For more casual setups — friend group chats where you want the bot **mostly silent** but **occasionally available on explicit ping** — enable `guest_mode`:
 
@@ -1167,8 +1169,10 @@ gateway:
   platforms:
     telegram:
       extra:
-        group_allowed_chats:
-          - "-1001234567890"   # your main allowlisted group
+        allow_from:
+          - "123456789"        # this person is authorized in every chat
+        allowed_chats:
+          - "-1001234567890"   # normal response location
         guest_mode: true       # non-allowlisted groups: allow on @mention only
 ```
 
@@ -1180,7 +1184,7 @@ TELEGRAM_GUEST_MODE=true
 
 Default: `false`.
 
-With `guest_mode: true`, a message from a non-allowlisted group is processed **only** if it explicitly @mentions the bot. The mention is required every turn — there's no session stickiness for guest interactions, so the bot never auto-engages in a friend group thread it isn't pinged into.
+With `guest_mode: true`, a message outside `allowed_chats` is processed **only** if the sender is authorized and explicitly @mentions the bot. The mention is required every turn — there's no session stickiness for guest interactions, so the bot never auto-engages in a friend group thread it isn't pinged into.
 
 DMs and allowlisted groups behave exactly as before.
 

@@ -186,12 +186,14 @@ def _principal_matches_allowlist(source, user_id: str, allowed_ids: set) -> bool
             check_ids.add(hex_user)
     return bool(check_ids & allowed_ids)
 def _telegram_config_authorizes_source(source: SessionSource, extra: object) -> Optional[bool]:
-    """Authorize a sender; a configured group list also restricts the group ID."""
+    """Personal grants precede group restrictions; group grants never authorize DMs."""
     if not isinstance(extra, dict):
         return None
 
     user_id = str(source.user_id or "").strip()
     global_allowed = _coerce_allow_set(extra.get("allow_from"))
+    if user_id and _allows(global_allowed, user_id):
+        return True
     if source.chat_type not in {"group", "forum", "channel"}:
         return _allows(global_allowed, user_id) if global_allowed else None
 
@@ -212,10 +214,17 @@ def _telegram_config_authorizes_source(source: SessionSource, extra: object) -> 
 
 
 def _telegram_listed_group_decision(source: SessionSource, extra: object) -> Optional[bool]:
-    """A listed Telegram group needs both its group ID and a group sender grant."""
+    """Personal grants win; other senders need the configured group and sender grants."""
     if source.chat_type not in _GROUP_CHAT_TYPES:
         return None
     config = extra if isinstance(extra, dict) else {}
+    personal = (
+        _coerce_allow_set(config.get("allow_from"))
+        | _coerce_allow_set(_auth_env("TELEGRAM_ALLOWED_USERS"))
+        | _coerce_allow_set(_auth_env("GATEWAY_ALLOWED_USERS"))
+    )
+    if source.user_id and _allows(personal, str(source.user_id)):
+        return True
     config_groups = _coerce_allow_set(config.get("group_allowed_chats"))
     groups = config_groups or _coerce_allow_set(_auth_env("TELEGRAM_GROUP_ALLOWED_CHATS"))
     if not groups:
@@ -494,9 +503,9 @@ class GatewayAuthorizationMixin:
         return isinstance(sender_allow, (list, tuple, set)) and any(str(item).strip() for item in sender_allow)
 
     def _pairing_store_for(self, source: "SessionSource"):
-        """Per-profile PairingStore for a source, else the global ``self.pairing_store``."""
+        """Pairing grants belong to the admitting bot, even when its runtime is routed."""
         per_profile = getattr(self, "pairing_stores", None) or {}
-        profile = getattr(source, "profile", None)
+        profile = self._adapter_profile_for_source(source)
         return per_profile[profile] if profile and profile in per_profile else getattr(self, "pairing_store", None)
 
     def _adapter_extra_for_source(self, source) -> dict:
@@ -657,9 +666,9 @@ class GatewayAuthorizationMixin:
     def _is_user_authorized(self, source: SessionSource, *, allow_adapter_delegation: bool = True) -> bool:
         """Whether a user may use the bot.
 
-        Order: trusted-upstream delegation, chat-scoped group allowlists, ``{PLATFORM}_ALLOW_BOTS``,
-        per-platform allow-all, adapter role auth, pairing store, env/config allowlists,
-        ``GATEWAY_ALLOW_ALL_USERS``, default deny. A bot-authored message that any of these admits
+        Telegram personal and pairing grants precede its group restrictions. Other paths use
+        trusted-upstream delegation, chat-scoped grants, allow-bots/allow-all, adapter role auth,
+        pairing and env/config allowlists, then default deny. A bot-authored message that any of these admits
         is still refused while its chat's loop guard is cooling down.
         """
         if not self._principal_authorized(source, allow_adapter_delegation=allow_adapter_delegation):
@@ -679,6 +688,10 @@ class GatewayAuthorizationMixin:
         is_group = source.chat_type in _GROUP_CHAT_TYPES
         is_group_or_forum = source.chat_type in _GROUP_FORUM_TYPES
         if source.platform == Platform.TELEGRAM and is_group:
+            # Pairing is a personal grant in this source's profile, not a group grant.
+            pairing_store = self._pairing_store_for(source)
+            if source.user_id and pairing_store is not None and pairing_store.is_approved("telegram", source.user_id):
+                return True
             with contextlib.suppress(Exception):
                 extra = self._adapter_extra_for_source(source)
                 listed_group = _telegram_listed_group_decision(source, extra)
