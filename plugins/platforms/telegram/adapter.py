@@ -894,8 +894,7 @@ class TelegramAdapter(BasePlatformAdapter):
             injected = self._is_sender_authorized(
                 normalized_user_id, chat_type=normalized_chat_type, chat_id=str(chat_id or normalized_user_id),
                 thread_id=str(thread_id) if thread_id is not None else None)
-            if injected is not None:
-                return injected
+            return injected is True
         auth_fn = self._legacy_runner_auth_fn()
         if auth_fn is not None:
             try:
@@ -907,7 +906,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 return bool(auth_fn(source))
             except Exception:
                 logger.debug(
-                    "[Telegram] Falling back to env-only callback auth for user %s", normalized_user_id, exc_info=True)
+                    "[Telegram] Callback authority failed; denying user %s", normalized_user_id, exc_info=True)
+                return False
         decision = self._env_allowlist_decision(normalized_user_id)
         if decision is None:
             # Fail-closed: no allowlist means deny unless GATEWAY_ALLOW_ALL_USERS is set.
@@ -1002,24 +1002,6 @@ class TelegramAdapter(BasePlatformAdapter):
         if not user_id:
             return True
 
-        listed_group = _telegram_listed_group_decision(source, self.config.extra)
-        if listed_group is not None:
-            if not listed_group:
-                return False
-            if getattr(self, "_authorization_check", None) is not None:
-                return self._is_sender_authorized(
-                    user_id, chat_type=source.chat_type, chat_id=source.chat_id,
-                    is_bot=source.is_bot, thread_id=source.thread_id,
-                ) is True
-            auth_fn = self._legacy_runner_auth_fn()
-            if auth_fn is not None:
-                try:
-                    return bool(auth_fn(source))
-                except Exception:
-                    logger.debug("[Telegram] Group intake authorization failed", exc_info=True)
-                    return False
-            return True
-
         config_authorized = _telegram_config_authorizes_source(source, self.config.extra)
 
         authorized: Optional[bool] = None
@@ -1047,13 +1029,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 decision = self._is_sender_authorized(
                     user_id, chat_type=source.chat_type, chat_id=source.chat_id, is_bot=source.is_bot,
                     thread_id=source.thread_id) if has_callback else None
-                if decision is not None:
-                    authorized = decision
+                if has_callback:
+                    # The registered authority owns routed grants; unknown must fail closed.
+                    authorized = decision is True
                 elif auth_fn is not None:
                     try:
                         authorized = bool(auth_fn(source))
                     except Exception:
-                        logger.debug("[Telegram] Falling back to env-only auth for user %s", user_id, exc_info=True)
+                        logger.debug("[Telegram] Message authority failed; denying user %s", user_id, exc_info=True)
+                        return False
         if authorized is None:
             if _scoped_gate_env("TELEGRAM_ALLOW_ALL_USERS").lower().strip() in {
                 "true",
@@ -1067,6 +1051,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 "yes",
             }:
                 return True
+
+            # Only the routed gateway knows profile-specific personal/pairing grants.
+            # A local group denial must not short-circuit that authority above.
+            listed_group = _telegram_listed_group_decision(source, self.config.extra)
+            if listed_group is not None:
+                return listed_group
 
             # Bare adapters have no runner to combine config and environment
             # grants. Apply the same scoped union locally as a safe fallback.

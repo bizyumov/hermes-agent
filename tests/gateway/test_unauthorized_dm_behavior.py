@@ -271,10 +271,14 @@ async def test_routed_profile_dm_uses_profile_pairing_store(monkeypatch):
     profile_store._is_rate_limited.return_value = False
     profile_store.generate_code.return_value = "PROFILE1"
     runner.pairing_stores = {"coder": profile_store}
+    # Distinct bots have distinct adapter identities; aliasing the primary would route
+    # admission to its pairing store even when the runtime profile is "coder".
+    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(send=AsyncMock())}
     runner._profile_adapters = {"coder": {Platform.TELEGRAM: adapter}}
 
     event = _make_event(Platform.TELEGRAM, "new-user", "new-user")
     event.source.profile = "coder"
+    event.source._transport_adapter_ref = lambda: adapter
 
     result = await runner._handle_message(event)
 

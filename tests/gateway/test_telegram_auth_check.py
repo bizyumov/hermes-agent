@@ -243,8 +243,8 @@ def test_empty_group_config_lists_defer_to_injected_authority():
     ) is True
 
 
-def test_config_allowlists_require_listed_group_and_group_sender():
-    """A listed group requires group_allow_from; allow_from grants DMs."""
+def test_personal_grant_precedes_listed_group_and_sender_restrictions():
+    """Personal grants survive both group restrictions; group-only grants stay scoped."""
     adapter = _make_adapter(
         allow_from=["global-user"],
         group_allow_from=["group-user"],
@@ -253,7 +253,7 @@ def test_config_allowlists_require_listed_group_and_group_sender():
 
     assert adapter._is_user_authorized_from_message(
         _make_message(from_user_id="global-user", chat_id=-100, chat_type="group")
-    ) is False
+    ) is True
     assert adapter._is_user_authorized_from_message(
         _make_message(from_user_id="group-user", chat_id=-100, chat_type="group")
     ) is True
@@ -265,10 +265,123 @@ def test_config_allowlists_require_listed_group_and_group_sender():
     ) is False
     assert adapter._is_user_authorized_from_message(
         _make_message(from_user_id="global-user", chat_id=-200, chat_type="group")
-    ) is False
+    ) is True
     assert adapter._is_user_authorized_from_message(
         _make_message(from_user_id="group-user", chat_id=123, chat_type="private")
     ) is False
+
+
+@pytest.mark.parametrize("grant", ["config", "telegram_env", "gateway_env", "pairing"])
+@pytest.mark.parametrize("chat_type", ["group", "supergroup", "channel"])
+def test_personal_grants_with_real_profile_files(tmp_path, monkeypatch, grant, chat_type):
+    """A personal grant survives group restrictions only in its own profile (A/B/A)."""
+    import json
+    from agent import secret_scope
+    from gateway.config import load_gateway_config
+    from gateway.pairing import PairingStore
+    from gateway.run import GatewayRunner
+
+    homes = {}
+    for name, owner in (("a", "111"), ("b", "222")):
+        home = tmp_path / name
+        home.mkdir()
+        policy = {
+            "allow_from": [owner] if grant == "config" else [],
+            "group_allowed_chats": ["-100"],
+            "group_allow_from": ["333"],
+        }
+        (home / "config.yaml").write_text(json.dumps({"telegram": policy}))
+        homes[name] = (home, owner)
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "ambient-user")
+    previous = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        for name in ("a", "b", "a"):
+            home, owner = homes[name]
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            scope = {}
+            if grant == "telegram_env":
+                scope["TELEGRAM_ALLOWED_USERS"] = owner
+            elif grant == "gateway_env":
+                scope["GATEWAY_ALLOWED_USERS"] = owner
+            token = secret_scope.set_secret_scope(scope)
+            try:
+                config = load_gateway_config()
+                adapter = _make_adapter()
+                adapter.config = config.platforms[Platform.TELEGRAM]
+                runner = object.__new__(GatewayRunner)
+                runner.adapters = {Platform.TELEGRAM: adapter}
+                runner.pairing_store = PairingStore()
+                if grant == "pairing":
+                    runner.pairing_store._approved_path("telegram").write_text(
+                        json.dumps({owner: {"approved_at": 1}})
+                    )
+                adapter._message_handler = runner._is_user_authorized
+                for sender, chat, expected in (
+                    ("111", -100, name == "a"),
+                    ("111", -200, name == "a"),
+                    ("ambient-user", -200, False),
+                    ("333", -100, True),
+                    ("333", -200, False),
+                    ("stranger", -100, False),
+                ):
+                    message = _make_message(from_user_id=sender, chat_id=chat, chat_type=chat_type)
+                    if chat_type == "supergroup":
+                        message.chat.is_forum = True
+                        message.is_topic_message = True
+                        message.message_thread_id = 7
+                    source = adapter._source_from_message_for_auth(message)
+                    assert adapter._is_user_authorized_from_message(message) is expected
+                    assert runner._is_user_authorized(source) is expected
+                if grant == "pairing":
+                    # Runtime routing must not substitute another bot's pairing grants.
+                    import weakref
+                    other_home, other_owner = homes["b" if name == "a" else "a"]
+                    with monkeypatch.context() as other_scope:
+                        other_scope.setenv("HERMES_HOME", str(other_home))
+                        other_store = PairingStore()
+                        other_store._approved_path("telegram").write_text(
+                            json.dumps({other_owner: {"approved_at": 1}})
+                        )
+                    runner.pairing_stores = {"routed": other_store}
+                    decisions = []
+                    for sender in (owner, other_owner):
+                        source = adapter._source_from_message_for_auth(
+                            _make_message(from_user_id=sender, chat_id=-200, chat_type=chat_type)
+                        )
+                        source.profile = "routed"
+                        source._transport_adapter_ref = weakref.ref(adapter)
+                        decisions.append(runner._is_user_authorized(source))
+                    assert decisions == [True, False]
+            finally:
+                secret_scope.reset_secret_scope(token)
+    finally:
+        secret_scope.set_multiplex_active(previous)
+
+
+@pytest.mark.parametrize("failure", ["exception", "unknown", "non_boolean"])
+@pytest.mark.parametrize("entrypoint", ["message", "callback"])
+def test_intake_does_not_replace_failed_routed_authority_with_local_grants(monkeypatch, failure, entrypoint):
+    """An unavailable routed authority cannot fall back to the receiving bot's grants."""
+    adapter = _make_adapter(
+        allow_from=["111"], group_allowed_chats=["-100"], group_allow_from=["*"]
+    )
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+
+    def authorize(*args, **kwargs):
+        if failure == "exception":
+            raise RuntimeError("routed authority unavailable")
+        return None if failure == "unknown" else "allow"
+
+    adapter.set_authorization_check(authorize)
+    for chat in (-100, -200):
+        if entrypoint == "message":
+            assert adapter._is_user_authorized_from_message(
+                _make_message(from_user_id=111, chat_id=chat, chat_type="group")
+            ) is False
+        else:
+            assert adapter._is_callback_user_authorized("111", chat_id=str(chat), chat_type="group") is False
 
 
 def test_runner_config_authorization_matches_telegram_intake(monkeypatch):
@@ -296,11 +409,11 @@ def test_runner_config_authorization_matches_telegram_intake(monkeypatch):
     runner.pairing_store.is_approved.return_value = False
 
     cases = (
-        (_make_message(from_user_id="global-user", chat_id=-100, chat_type="group"), False),
+        (_make_message(from_user_id="global-user", chat_id=-100, chat_type="group"), True),
         (_make_message(from_user_id="group-user", chat_id=-100, chat_type="group"), True),
         (_make_message(from_user_id="unlisted-user", chat_id=-100, chat_type="group"), False),
         (_make_message(from_user_id="unlisted-user", chat_id=-200, chat_type="group"), False),
-        (_make_message(from_user_id="global-user", chat_id=-200, chat_type="group"), False),
+        (_make_message(from_user_id="global-user", chat_id=-200, chat_type="group"), True),
         (_make_message(from_user_id="group-user", chat_id=123, chat_type="private"), False),
     )
     config_intake = []
@@ -389,13 +502,13 @@ def test_scalar_config_allowlists_match_sequence_semantics():
 
     assert adapter._is_user_authorized_from_message(
         _make_message(from_user_id=222, chat_id=-100, chat_type="group")
-    ) is False
+    ) is True
     assert adapter._is_user_authorized_from_message(
         _make_message(from_user_id=444, chat_id=-200, chat_type="group")
     ) is True
     assert adapter._is_user_authorized_from_message(
         _make_message(from_user_id=222, chat_id=-300, chat_type="group")
-    ) is False
+    ) is True
     assert adapter._is_user_authorized_from_message(
         _make_message(from_user_id=555, chat_id=-200, chat_type="group")
     ) is False
@@ -586,7 +699,7 @@ def test_profile_route_selects_scoped_authority_before_default_callback(monkeypa
 
     seen = []
 
-    adapter = _make_adapter(allow_from=["owner"])
+    adapter = _make_adapter(allow_from=["owner"], group_allowed_chats=["-200"], group_allow_from=["owner"])
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._multiplex_on = lambda: True
