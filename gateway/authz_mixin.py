@@ -42,25 +42,23 @@ _ALLOW_BOTS_ENV = {
 
 
 def _auth_env(name: str, default: str = "") -> str:
-    """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
+    """Read authorization input without borrowing another multiplex profile's grants."""
     if not name:
         return default
-    try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
-    except Exception:
-        return (os.getenv(name) or default).strip()
+    from agent.secret_scope import UnscopedSecretError, get_secret, is_multiplex_active
 
     try:
-        val = get_secret(name)
-        if val is not None and str(val).strip():
-            return str(val).strip()
+        value = get_secret(name)
     except UnscopedSecretError:
-        # Multiplex mode intentionally rejects unscoped credential reads. Do
-        # not defeat that isolation boundary by falling through to another
-        # profile's process-global environment.
         return default
     except Exception:
-        pass
+        if is_multiplex_active():
+            return default
+        return (os.getenv(name) or default).strip()
+    if value is not None and str(value).strip():
+        return str(value).strip()
+    if is_multiplex_active():
+        return default
     return (os.getenv(name) or default).strip()
 
 
@@ -205,42 +203,57 @@ def _principal_matches_allowlist(source, user_id: str, allowed_ids: set) -> bool
 
 
 def _telegram_config_authorizes_source(source: SessionSource, extra: object) -> Optional[bool]:
-    """Apply Telegram's config allowlists with their documented scopes.
-
-    ``allow_from`` applies in every chat type; ``group_allow_from`` and
-    ``group_allowed_chats`` only add grants for group-like sources.  Returning
-    ``None`` distinguishes a source with no non-empty applicable config
-    allowlist from a sender that was explicitly rejected by one. Empty lists
-    are common config defaults and contribute neither a grant nor a rejection.
-    """
+    """Personal grants precede group restrictions; group grants never authorize DMs."""
     if not isinstance(extra, dict):
         return None
 
     user_id = str(source.user_id or "").strip()
     global_allowed = _coerce_allow_set(extra.get("allow_from"))
-    applicable_allowlists = [global_allowed]
-
-    if source.chat_type in {"group", "forum", "channel"}:
-        group_users = _coerce_allow_set(extra.get("group_allow_from"))
-        group_chats = _coerce_allow_set(extra.get("group_allowed_chats"))
-        applicable_allowlists.extend((group_users, group_chats))
-
-    if not any(applicable_allowlists):
-        return None
-
-    if user_id and ("*" in global_allowed or user_id in global_allowed):
+    if user_id and _allows(global_allowed, user_id):
         return True
+    if source.chat_type not in {"group", "forum", "channel"}:
+        return _allows(global_allowed, user_id) if global_allowed else None
 
-    if source.chat_type in {"group", "forum", "channel"}:
-        if user_id and ("*" in group_users or user_id in group_users):
-            return True
+    group_users = _coerce_allow_set(extra.get("group_allow_from"))
+    group_chats = _coerce_allow_set(extra.get("group_allowed_chats"))
+    if not (global_allowed or group_users or group_chats):
+        return None
+    chat_id = str(source.chat_id or "").strip()
+    group_matches = not group_chats or _allows(group_chats, chat_id)
+    if not group_matches:
+        return False
+    if group_chats:
+        return bool(user_id and _allows(group_users, user_id))
+    if not (global_allowed or group_users):
+        return None
+    sender_matches = bool(user_id) and (_allows(global_allowed, user_id) or _allows(group_users, user_id))
+    return bool(sender_matches)
 
-        chat_id = str(source.chat_id or "").strip()
-        if chat_id and ("*" in group_chats or chat_id in group_chats):
-            return True
 
-    return False
-
+def _telegram_listed_group_decision(source: SessionSource, extra: object) -> Optional[bool]:
+    """Personal grants win; other senders need the configured group and sender grants."""
+    if source.chat_type not in _GROUP_CHAT_TYPES:
+        return None
+    config = extra if isinstance(extra, dict) else {}
+    personal = (
+        _coerce_allow_set(config.get("allow_from"))
+        | _coerce_allow_set(_auth_env("TELEGRAM_ALLOWED_USERS"))
+        | _coerce_allow_set(_auth_env("GATEWAY_ALLOWED_USERS"))
+    )
+    if source.user_id and _allows(personal, str(source.user_id)):
+        return True
+    config_groups = _coerce_allow_set(config.get("group_allowed_chats"))
+    groups = config_groups or _coerce_allow_set(_auth_env("TELEGRAM_GROUP_ALLOWED_CHATS"))
+    if not groups:
+        return None
+    senders = (
+        _coerce_allow_set(config.get("group_allow_from")) if config_groups
+        else _coerce_allow_set(_auth_env("TELEGRAM_GROUP_ALLOWED_USERS"))
+    )
+    return bool(
+        source.user_id and _allows(groups, source.chat_id)
+        and _allows(senders, str(source.user_id))
+    )
 
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
@@ -416,9 +429,9 @@ class GatewayAuthorizationMixin:
         return isinstance(sender_allow, (list, tuple, set)) and any(str(item).strip() for item in sender_allow)
 
     def _pairing_store_for(self, source: "SessionSource"):
-        """Per-profile PairingStore for a source, else the global ``self.pairing_store``."""
+        """Pairing grants belong to the admitting bot, even when its runtime is routed."""
         per_profile = getattr(self, "pairing_stores", None) or {}
-        profile = getattr(source, "profile", None)
+        profile = self._adapter_profile_for_source(source)
         return per_profile[profile] if profile and profile in per_profile else getattr(self, "pairing_store", None)
 
     def _adapter_extra_for_source(self, source) -> dict:
@@ -506,14 +519,12 @@ class GatewayAuthorizationMixin:
             or self._adapter_flag(source.platform, "authorization_is_upstream", adapter_profile)
         ):
             return True
-        # Chat-scoped group allowlists must work with ``user_id is None`` (anonymous admins,
-        # sender_chat posts, channel broadcasts).
-        if is_group and source.chat_id:
+        # Non-Telegram chat-scoped grants can authorize identityless group posts.
+        if is_group and source.chat_id and source.platform != Platform.TELEGRAM:
             chat_allowlist_env = _GROUP_CHAT_ENV.get(source.platform, "")
             if chat_allowlist_env and _allows(_coerce_allow_set(_platform_gate_env(chat_allowlist_env)), source.chat_id):
                 return True
-            # config.yaml fallback (``extra.group_allowed_chats``): Telegram observe-unmentioned mode
-            # strips user_id, so the env-only check above misses it.
+            # Config fallback for non-Telegram platform chat-scoped grants.
             with contextlib.suppress(Exception):
                 adapter_group_allowed = self._adapter_extra_for_source(source).get("group_allowed_chats")
                 if adapter_group_allowed and _allows(_coerce_allow_set(adapter_group_allowed), source.chat_id):
@@ -547,9 +558,9 @@ class GatewayAuthorizationMixin:
     def _is_user_authorized(self, source: SessionSource, *, allow_adapter_delegation: bool = True) -> bool:
         """Whether a user may use the bot.
 
-        Order: trusted-upstream delegation, chat-scoped group allowlists, ``{PLATFORM}_ALLOW_BOTS``,
-        per-platform allow-all, adapter role auth, pairing store, env/config allowlists,
-        ``GATEWAY_ALLOW_ALL_USERS``, default deny.
+        Telegram personal and pairing grants precede its group restrictions. Other paths use
+        trusted-upstream delegation, chat-scoped grants, allow-bots/allow-all, adapter role auth,
+        pairing and env/config allowlists, then default deny.
         """
         # HA events are system-generated (HASS_TOKEN); webhook events are HMAC-verified.
         if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
@@ -558,6 +569,19 @@ class GatewayAuthorizationMixin:
         adapter_profile = self._adapter_profile_for_source(source)
         is_group = source.chat_type in _GROUP_CHAT_TYPES
         is_group_or_forum = source.chat_type in _GROUP_FORUM_TYPES
+        if source.platform == Platform.TELEGRAM and is_group:
+            # Pairing is a personal grant in this source's profile, not a group grant.
+            pairing_store = self._pairing_store_for(source)
+            if source.user_id and pairing_store is not None and pairing_store.is_approved("telegram", source.user_id):
+                return True
+            with contextlib.suppress(Exception):
+                extra = self._adapter_extra_for_source(source)
+                listed_group = _telegram_listed_group_decision(source, extra)
+                if listed_group is not None:
+                    return listed_group
+                decision = _telegram_config_authorizes_source(source, extra)
+                if decision is True:
+                    return True
         if self._chat_scoped_grant(source, adapter_profile, is_group, allow_adapter_delegation):
             return True
         user_id = source.user_id
@@ -611,8 +635,8 @@ class GatewayAuthorizationMixin:
             return _env_truthy("GATEWAY_ALLOW_ALL_USERS")
 
         if is_group and source.chat_id:
-            # Telegram group traffic authorized by chat ID (TELEGRAM_GROUP_ALLOWED_USERS gates the sender).
-            if group_chat_allowlist and _allows(_coerce_allow_set(group_chat_allowlist), source.chat_id):
+            # Telegram's listed group/sender gate was resolved above.
+            if source.platform != Platform.TELEGRAM and group_chat_allowlist and _allows(_coerce_allow_set(group_chat_allowlist), source.chat_id):
                 return True
             if (
                 source.platform == Platform.TELEGRAM and group_user_allowlist

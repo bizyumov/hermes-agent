@@ -139,7 +139,7 @@ import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
-from gateway.authz_mixin import _telegram_config_authorizes_source
+from gateway.authz_mixin import _telegram_config_authorizes_source, _telegram_listed_group_decision
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter, SendResult, classify_send_error,
@@ -758,8 +758,7 @@ class TelegramAdapter(BasePlatformAdapter):
             injected = self._is_sender_authorized(
                 normalized_user_id, chat_type=normalized_chat_type, chat_id=str(chat_id or normalized_user_id),
                 thread_id=str(thread_id) if thread_id is not None else None)
-            if injected is not None:
-                return injected
+            return injected is True
         auth_fn = self._legacy_runner_auth_fn()
         if auth_fn is not None:
             try:
@@ -771,7 +770,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 return bool(auth_fn(source))
             except Exception:
                 logger.debug(
-                    "[Telegram] Falling back to env-only callback auth for user %s", normalized_user_id, exc_info=True)
+                    "[Telegram] Callback authority failed; denying user %s", normalized_user_id, exc_info=True)
+                return False
         decision = self._env_allowlist_decision(normalized_user_id)
         if decision is None:
             # Fail-closed: no allowlist means deny unless GATEWAY_ALLOW_ALL_USERS is set.
@@ -909,9 +909,6 @@ class TelegramAdapter(BasePlatformAdapter):
         if not user_id:
             return True
 
-        # Config allowlists use the same union as runner authorization: global
-        # users work everywhere, while group users and allowed group chats add
-        # scoped grants without widening direct-message access.
         config_authorized = _telegram_config_authorizes_source(source, self.config.extra)
 
         authorized: Optional[bool] = None
@@ -927,38 +924,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     authorized = bool(callback_auth(
                         user_id, chat_id=source.chat_id, chat_type=source.chat_type, thread_id=source.thread_id,
                         user_name=source.user_name))
-
-        runner = getattr(self, "gateway_runner", None)
-        if runner is None:
-            runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
-        intake_auth = getattr(runner, "_adapter_intake_authorization_decision", None)
-        if authorized is None and callable(intake_auth):
-            try:
-                intake_decision = intake_auth(
-                    source,
-                    config_authorized=config_authorized,
-                )
-                # ``None`` is the scoped runner's explicit instruction to
-                # preserve the pairing path. It is terminal: continuing here
-                # would evaluate fallback auth outside the routed profile's
-                # runtime scope and could consult another profile's state.
-                if intake_decision is None:
-                    return True
-                authorized = bool(intake_decision)
-            except Exception:
-                logger.debug(
-                    "[Telegram] Falling back after scoped auth failed for user %s",
-                    user_id,
-                    exc_info=True,
-                )
-
-        if config_authorized is True:
-            return True
-
-        auth_is_configured = (
-            config_authorized is not None or self._telegram_auth_env_configured()
-        )
-
         if authorized is None:
             # Runner's full auth chain; prefer the set_authorization_check callback (survives multiplex
             # handler wrapping, unlike bound-handler __self__).
@@ -966,18 +931,20 @@ class TelegramAdapter(BasePlatformAdapter):
             has_callback = getattr(self, "_authorization_check", None) is not None
             if has_callback or auth_fn is not None:
                 # No allowlist → unknown DMs must reach pairing, not be default-denied here.
-                if config_authorized is None and not self._telegram_auth_env_configured():
+                if source.chat_type == "dm" and config_authorized is None and not self._telegram_auth_env_configured():
                     return True
                 decision = self._is_sender_authorized(
                     user_id, chat_type=source.chat_type, chat_id=source.chat_id, is_bot=source.is_bot,
                     thread_id=source.thread_id) if has_callback else None
-                if decision is not None:
-                    authorized = decision
+                if has_callback:
+                    # The registered authority owns routed grants; unknown must fail closed.
+                    authorized = decision is True
                 elif auth_fn is not None:
                     try:
                         authorized = bool(auth_fn(source))
                     except Exception:
-                        logger.debug("[Telegram] Falling back to env-only auth for user %s", user_id, exc_info=True)
+                        logger.debug("[Telegram] Message authority failed; denying user %s", user_id, exc_info=True)
+                        return False
         if authorized is None:
             if _scoped_gate_env("TELEGRAM_ALLOW_ALL_USERS").lower().strip() in {
                 "true",
@@ -991,6 +958,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 "yes",
             }:
                 return True
+
+            # Only the routed gateway knows profile-specific personal/pairing grants.
+            # A local group denial must not short-circuit that authority above.
+            listed_group = _telegram_listed_group_decision(source, self.config.extra)
+            if listed_group is not None:
+                return listed_group
 
             # Bare adapters have no runner to combine config and environment
             # grants. Apply the same scoped union locally as a safe fallback.
