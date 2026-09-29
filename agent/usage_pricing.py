@@ -261,6 +261,8 @@ _OFFICIAL_DOCS_PRICING[("openai", "gpt-6-astra")] = _snap(
 # Terra has no published model page yet, so it deliberately has no row.
 for _slug, _inp, _out, _read, _write, _inp_above, _out_above, _read_above, _write_above in (
     ("gpt-6-sol", "2.00", "10.00", "0.20", "2.50", "4.00", "15.00", "0.40", "5.00"),
+    # 6.1 Sol: same input/output as 6 Sol, but cached input is 0.05x input (not 0.10x).
+    ("gpt-6.1-sol", "2.00", "10.00", "0.10", "2.50", "4.00", "15.00", "0.20", "5.00"),
     ("gpt-6-luna", "0.10", "0.50", "0.01", "0.125", "0.20", "0.75", "0.02", "0.25"),
 ):
     _OFFICIAL_DOCS_PRICING[("openai", _slug)] = _snap(
@@ -298,6 +300,7 @@ for _provider, _alias, _canonical in (
     *((("openai", f"{m}-{suffix}", m)
        for m in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna")
        for suffix in ("pro", "900k"))),
+    ("openai", "gpt-6.1-sol-pro", "gpt-6.1-sol"),  # no -900k: not verified above 272K on Codex
     ("google", "gemini-3.1-pro-preview", "gemini-3.1-pro"),
     ("google", "gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite"),
 ):
