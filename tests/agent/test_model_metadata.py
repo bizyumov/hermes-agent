@@ -626,13 +626,13 @@ class TestCodexOAuthContextLength:
 
         ok = MagicMock(status_code=200)
         ok.json.return_value = {"models": [{"slug": "GPT-5.6-Luna", "context_window": 272_000, "max_context_window": 600_000}]}
-        route = dict(base_url="https://chatgpt.com/backend-api/codex", api_key=_codex_jwt("fake-token"), provider="openai-codex")
+        route = dict(base_url="https://chatgpt.com/backend-api/codex", api_key="fake-token", provider="openai-codex")
         with patch.object(mm, "_codex_oauth_context_cache", {}), patch.object(mm, "_codex_oauth_max_context_cache", {}), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
-            with patch("agent.model_metadata.model_metadata_http.get", return_value=ok):
+            with patch("agent.model_metadata.requests.get", return_value=ok):
                 assert mm.get_model_context_length(model="gpt-5.6-luna-900k", **route) == 600_000
-            with patch("agent.model_metadata.model_metadata_http.get", side_effect=OSError("catalog down")), \
+            with patch("agent.model_metadata.requests.get", side_effect=OSError("catalog down")), \
                  patch("agent.model_metadata.time.time", return_value=time.time() + mm._CODEX_OAUTH_CONTEXT_CACHE_TTL + 1):
                 assert mm.get_model_context_length(model="gpt-5.6-luna-900k", **route) == 600_000
 
@@ -651,8 +651,8 @@ class TestCodexOAuthContextLength:
         ok = MagicMock(status_code=200)
         ok.json.return_value = {"models": [{"slug": "gpt-5.6-luna", "context_window": 272_000, "max_context_window": 872_000}]}
         with patch.object(mm, "_codex_oauth_context_cache", _ContextCache()), patch.object(mm, "_codex_oauth_max_context_cache", max_cache), \
-             patch("agent.model_metadata.model_metadata_http.get", return_value=ok):
-            live, _fresh = mm._fetch_codex_oauth_context_lengths_with_source(_codex_jwt("fake-token"))
+             patch("agent.model_metadata.requests.get", return_value=ok):
+            live, _fresh = mm._fetch_codex_oauth_context_lengths_with_source("fake-token")
         assert live == {"gpt-5.6-luna": 272_000}
 
 
