@@ -72,7 +72,7 @@ def _read_codex_credential() -> tuple[Optional[str], Optional[str]]:
     try:
         from agent.auxiliary_client import _resolve_codex_credential_and_base
 
-        token, base_url = _resolve_codex_credential_and_base()
+        token, base_url = _resolve_codex_credential_and_base(API_MODEL)
         if isinstance(token, str) and token.strip():
             return token.strip(), base_url
         return None, None
