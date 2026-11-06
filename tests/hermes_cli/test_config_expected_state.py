@@ -35,6 +35,15 @@ def test_expected_state_comparison_keeps_boolean_integer_types_distinct(tmp_path
         config.atomic_config_replace(path, {"setting": 2}, expected_state={"setting": True})
     assert config.fast_safe_load(path.read_text()) == {"setting": 1}
 
+def test_expected_state_comparison_keeps_nested_mapping_key_types_distinct(tmp_path):
+    path = tmp_path / "config.yaml"
+    incoming = {"custom": {1: "same"}}
+    config.atomic_config_replace(path, incoming)
+    with pytest.raises(ValueError, match="changed"):
+        config.atomic_config_replace(path, {"custom": {}},
+                                     expected_state={"custom": {True: "same"}})
+    assert config.fast_safe_load(path.read_text()) == incoming
+
 
 def test_shared_native_write_coordination_rechecks_expected_state(tmp_path, monkeypatch):
     path = tmp_path / "config.yaml"

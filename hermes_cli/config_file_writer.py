@@ -5,10 +5,20 @@ from pathlib import Path
 from typing import Any
 
 
+def _typed_key(value: Any) -> tuple:
+    if isinstance(value, tuple):
+        return type(value), tuple(_typed_key(item) for item in value)
+    if isinstance(value, frozenset):
+        return type(value), frozenset(_typed_key(item) for item in value)
+    return type(value), value
+
+
 def _same_values(left: Any, right: Any) -> bool:
     if isinstance(left, dict) and isinstance(right, dict):
-        return left.keys() == right.keys() and all(
-            _same_values(left[key], right[key]) for key in left)
+        left_keys = {_typed_key(key): key for key in left}
+        right_keys = {_typed_key(key): key for key in right}
+        return left_keys.keys() == right_keys.keys() and all(
+            _same_values(left[left_keys[key]], right[right_keys[key]]) for key in left_keys)
     if isinstance(left, list) and isinstance(right, list):
         return len(left) == len(right) and all(
             _same_values(a, b) for a, b in zip(left, right))
