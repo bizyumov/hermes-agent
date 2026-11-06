@@ -45,7 +45,7 @@ dependencies = [
   # it regardless; it is no longer OUR trust source.
   # ssl_verify uses truststore's private original SSLContext for explicit CA overrides.
   # Keep this exact until that path has a public-API replacement.
-  "truststore==0.10.4; python_version >= '3.14'",
+  "truststore==0.10.5; python_version >= '3.14'",
   "python-dotenv==1.2.2; python_version >= '3.14'",
   "fire==0.7.1; python_version >= '3.14'",
   "httpx[socks]==0.28.1; python_version >= '3.14'",
@@ -603,6 +603,11 @@ kittentts = "(platform_machine != 'ARM64' or sys_platform != 'win32') and (platf
 piper = "(platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or sys_platform != 'darwin') and sys_platform != 'android'"
 # no playwright on android
 google-meet = "sys_platform != 'android'"
+
+[tool.uv.sources]
+# truststore #212: repeated default-path setup grows OpenSSL <3.4 lookup chains.
+# Pin the reviewed #213 correction; the same-version PyPI wheel lacks this fix.
+truststore = { git = "https://github.com/Cr1stal/truststore.git", rev = "bd68d581c011d406daf5ddec7e21e38794772c47" }
 
 [tool.uv]
 # uv otherwise enables the dev group by default, including in payload builds.
