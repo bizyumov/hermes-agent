@@ -19,8 +19,8 @@ jobs:
     #
     # One larger runner installs one time. vitest, tsc and eslint each size
     # their own worker pool from the core count.
-    runs-on: blacksmith-32vcpu-ubuntu-2404
-    timeout-minutes: 30
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 90 }}
     steps:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:

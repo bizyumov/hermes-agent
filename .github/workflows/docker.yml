@@ -71,7 +71,7 @@ jobs:
   # the parent stable-release workflow, which passes the candidate commit.
   mode:
     name: Resolve release phase
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     outputs:
       phase: ${{ steps.resolve.outputs.phase }}
@@ -100,7 +100,7 @@ jobs:
     name: Detect affected areas
     needs: [mode]
     if: needs.mode.outputs.release != 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     outputs:
       build: ${{ steps.gate.outputs.build }}
@@ -145,7 +145,7 @@ jobs:
     needs: [mode, detect]
     if: >-
       !cancelled() && needs.mode.result == 'success' &&
-      ((needs.mode.outputs.release != 'true' && github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.build == 'true') || needs.mode.outputs.phase == 'test')
+      ((needs.mode.outputs.release != 'true' && needs.detect.outputs.build == 'true') || needs.mode.outputs.phase == 'test')
     strategy:
       fail-fast: false
       matrix:
@@ -157,16 +157,16 @@ jobs:
         variant: [slim, desktop]
         include:
           - arch: amd64
-            runner: blacksmith-32vcpu-ubuntu-2404
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
             platform: linux/amd64
           # arm64 builds on the native arm64 larger runner. A build of
           # linux/arm64 on an x64 host uses emulation.
           - arch: arm64
-            runner: blacksmith-32vcpu-ubuntu-2404-arm
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-32vcpu-ubuntu-2404-arm' || 'ubuntu-24.04-arm' }}
             platform: linux/arm64
 
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 45 || 120 }}
     steps:
       - name: Checkout code
         uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
@@ -211,6 +211,7 @@ jobs:
       # still fails the job — only the first attempt has continue-on-error.
       # Refs: docker/setup-buildx-action#510
       - name: Set up Docker Buildx
+        if: github.repository == 'NousResearch/hermes-agent'
         id: buildx
         continue-on-error: true
         uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184  # v2
@@ -219,9 +220,20 @@ jobs:
         if: steps.buildx.outcome == 'failure'
         uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184  # v2
 
+      - name: Set up Docker Buildx on standard runners
+        if: github.repository != 'NousResearch/hermes-agent'
+        id: fork_buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Set up Docker Buildx on standard runners (retry)
+        if: github.repository != 'NousResearch/hermes-agent' && steps.fork_buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
       # Build once, load into the local daemon for testing.  Cached
       # per-arch; the push step below reuses every layer from this build.
       - name: Build image (${{ matrix.variant }}/${{ matrix.arch }})
+        if: github.repository == 'NousResearch/hermes-agent'
         uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850  # v2
         with:
           context: .
@@ -236,6 +248,20 @@ jobs:
           cache-from: type=gha,scope=docker-${{ matrix.arch }}
           cache-to: ${{ (github.event_name != 'pull_request' && matrix.variant == 'slim') && format('type=gha,mode=max,scope=docker-{0}', matrix.arch) || '' }}
 
+
+      - name: Build image on standard runners (${{ matrix.variant }}/${{ matrix.arch }})
+        if: github.repository != 'NousResearch/hermes-agent'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.IMAGE_NAME }}:test
+          build-args: |
+            HERMES_BOT_DESKTOP=${{ matrix.variant == 'desktop' && '1' || '0' }}
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: ${{ (github.event_name != 'pull_request' && matrix.variant == 'slim') && format('type=gha,mode=max,scope=docker-{0}', matrix.arch) || '' }}
 
       # Run the docker-integration test suite against the freshly-built image
       # already loaded into the local daemon (`:test`). The fixture's
@@ -348,11 +374,11 @@ jobs:
         variant: [slim, desktop]
         include:
           - arch: amd64
-            runner: blacksmith-32vcpu-ubuntu-2404
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
             platform: linux/amd64
           # Native arm64 for the same reason as the build matrix above.
           - arch: arm64
-            runner: blacksmith-32vcpu-ubuntu-2404-arm
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-32vcpu-ubuntu-2404-arm' || 'ubuntu-24.04-arm' }}
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -540,8 +566,8 @@ jobs:
       matrix:
         arch: [amd64, arm64]
         variant: [slim, desktop]
-    runs-on: blacksmith-32vcpu-ubuntu-2404
-    timeout-minutes: 45
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 45 || 120 }}
     env:
       ARCH: ${{ matrix.arch }}
       RELEASE_TAG: ${{ inputs.tag }}
@@ -766,7 +792,7 @@ jobs:
     name: Docker phase requirements met
     if: always() && inputs.release-phase != ''
     needs: [mode, build, release-publish, release-publish-manifest]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - name: Validate phase job results
