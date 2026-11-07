@@ -710,7 +710,7 @@ class VoiceReceiver:
     CHANNELS = 2               # Discord sends stereo
     REKEY_FAILURE_STREAK = 25  # consecutive NaCl failures → re-resolve creds
 
-    def __init__(self, voice_client, allowed_user_ids: set | None = None):
+    def __init__(self, voice_client, allowed_user_ids: set | None = None, *, on_pcm=None):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
         self._running = False
@@ -732,6 +732,11 @@ class VoiceReceiver:
         self._ssrc_to_user: dict[int, int] = {}
         self._lock = threading.Lock()
         self._buffers: dict[int, bytearray] = defaultdict(bytearray)
+        self._source_epochs = defaultdict(int)
+        self._completed_source_ids = ()
+        self._discarded_source_ids = ()
+        self._trusted_ssrc_users = {}
+        self._on_pcm = on_pcm or (lambda frame: None)
         self._last_packet_time: dict[int, float] = {}
         # Opus decoder per SSRC (each user needs own decoder state)
         self._decoders: dict[int, object] = {}
@@ -857,6 +862,7 @@ class VoiceReceiver:
             self._last_packet_time.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
+            self._trusted_ssrc_users.clear()
         logger.info(
             "VoiceReceiver stopped (frames ok=%d, decrypt_failed=%d, "
             "dave_unmapped_dropped=%d)",
@@ -876,6 +882,7 @@ class VoiceReceiver:
     def map_ssrc(self, ssrc: int, user_id: int):
         with self._lock:
             self._ssrc_to_user[ssrc] = user_id
+            self._trusted_ssrc_users[ssrc] = user_id
 
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5); ``conn.hook`` is
@@ -1093,14 +1100,25 @@ class VoiceReceiver:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
             self._decode_ok += 1
-            with self._lock:
-                self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
+            self._accept_pcm(ssrc, pcm, seq, _timestamp)
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
             logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
             return
+
+    def _accept_pcm(self, ssrc: int, pcm: bytes, sequence: int, timestamp: int) -> None:
+        from plugins.platforms.discord.voice_streaming_input import PCMFrame
+
+        with self._lock:
+            if not self._running or self._paused:
+                return
+            arrived_at = time.monotonic()
+            self._buffers[ssrc].extend(pcm)
+            self._last_packet_time[ssrc] = arrived_at
+            self._on_pcm(PCMFrame((ssrc, self._source_epochs[ssrc]),
+                                 self._trusted_ssrc_users.get(ssrc, 0), bytes(pcm),
+                                 sequence, timestamp, arrived_at))
 
     # --- Silence detection ---
 
@@ -1127,56 +1145,64 @@ class VoiceReceiver:
         return 0
 
     def check_silence(self) -> list:
-        """Return list of (user_id, pcm_bytes) for completed utterances."""
+        """Return legacy pairs plus aligned completion/discard source identities."""
         now = time.monotonic()
-        completed = []
+        completed, source_ids, discarded_ids = [], [], []
         with self._lock:
             ssrc_user_map = dict(self._ssrc_to_user)
-            ssrc_list = list(self._buffers.keys())
-            for ssrc in ssrc_list:
-                last_time = self._last_packet_time.get(ssrc, now)
-                silence_duration = now - last_time
+            for ssrc in list(self._buffers):
+                silence_duration = now - self._last_packet_time.get(ssrc, now)
                 buf = self._buffers[ssrc]
-                # 48kHz, 16-bit, stereo = 192000 bytes/sec
+                source_id = (ssrc, self._source_epochs[ssrc])
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
                 if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
-                    user_id = ssrc_user_map.get(ssrc, 0)
-                    if not user_id:
-                        # SSRC unmapped (SPEAKING missing after rejoin) — infer from channel.
-                        user_id = self._infer_user_for_ssrc(ssrc)
+                    user_id = ssrc_user_map.get(ssrc, 0) or self._infer_user_for_ssrc(ssrc)
                     if user_id:
                         completed.append((user_id, bytes(buf)))
+                        source_ids.append(source_id)
+                    else:
+                        discarded_ids.append(source_id)
+                    self._source_epochs[ssrc] += 1
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
                 elif silence_duration >= self.SILENCE_THRESHOLD * 2:
-                    # Stale buffer with no valid user — discard
+                    discarded_ids.append(source_id)
+                    self._source_epochs[ssrc] += 1
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
+            self._completed_source_ids = tuple(source_ids)
+            self._discarded_source_ids = tuple(discarded_ids)
         return completed
 
     def flush_pending(self) -> list:
-        """Return buffered utterances that have not yet reached silence."""
-        completed = []
+        """Return retained tails and retire every shorter or unidentified source."""
+        completed, source_ids, discarded_ids = [], [], []
         with self._lock:
             ssrc_user_map = dict(self._ssrc_to_user)
             for ssrc, buf in list(self._buffers.items()):
-                # 48kHz, 16-bit, stereo = 192000 bytes/sec
+                source_id = (ssrc, self._source_epochs[ssrc])
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
-                if buf_duration >= self.MIN_SPEECH_DURATION:
-                    user_id = ssrc_user_map.get(ssrc, 0)
-                    if not user_id:
-                        user_id = self._infer_user_for_ssrc(ssrc)
-                    if user_id:
-                        completed.append((user_id, bytes(buf)))
+                user_id = ssrc_user_map.get(ssrc, 0) or self._infer_user_for_ssrc(ssrc)
+                if buf_duration >= self.MIN_SPEECH_DURATION and user_id:
+                    completed.append((user_id, bytes(buf)))
+                    source_ids.append(source_id)
+                else:
+                    discarded_ids.append(source_id)
+                self._source_epochs[ssrc] += 1
                 self._buffers.pop(ssrc, None)
                 self._last_packet_time.pop(ssrc, None)
+            self._completed_source_ids = tuple(source_ids)
+            self._discarded_source_ids = tuple(discarded_ids)
         return completed
 
     def discard_pending(self) -> None:
-        """Drop buffered PCM that no poll or flush has emitted yet."""
+        """Invalidate buffered source generations before any subsequent capture."""
         with self._lock:
+            for ssrc in self._buffers:
+                self._source_epochs[ssrc] += 1
             self._buffers.clear()
             self._last_packet_time.clear()
+            self._completed_source_ids = ()
 
     # --- PCM -> WAV conversion (for Whisper STT) ---
 
@@ -1272,6 +1298,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self._voice_receivers: dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
         self._voice_listen_tasks: dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
+        self._voice_live_ingress = {}
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
         # Voice-reply mode ("off"|"voice_only"|"all") per linked text-channel id (set by run.py) so
         # the inactivity timer keeps the bot in channel for /voice off, unlike /voice leave.
@@ -3805,7 +3832,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             self._reset_voice_timeout(guild_id)
             self._bind_voice_text_channel(guild_id, text_channel_id, source)
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                from plugins.platforms.discord.voice_streaming_input import VoiceStreamIngress
+                ingress = VoiceStreamIngress(self, guild_id)
+                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids, on_pcm=ingress.offer)
+                self._voice_live_ingress[guild_id] = ingress
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -3822,37 +3852,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             return True
 
     async def leave_voice_channel(self, guild_id: int) -> None:
-        """Disconnect from the voice channel in a guild."""
-        async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
-            receiver = self._voice_receivers.pop(guild_id, None)
-            pending_inputs = []
-            if receiver:
-                pending_inputs = receiver.flush_pending()
-                receiver.stop()
-            listen_task = self._voice_listen_tasks.pop(guild_id, None)
-            if listen_task:
-                listen_task.cancel()
-            guild = self._client.get_guild(guild_id) if self._client is not None else None
-            captured_for = self._voice_text_channels.get(guild_id)
-            for user_id, pcm_data in pending_inputs:
-                if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
-                    await self._process_voice_input(guild_id, user_id, pcm_data, captured_for)
-            # Tear down the mixer (stops the continuous outgoing stream).
-            if getattr(self, "_voice_mixers", None) is not None:
-                self._voice_mixers.pop(guild_id, None)
-            vc = self._voice_clients.pop(guild_id, None)
-            if vc and vc.is_connected():
-                try:
-                    if vc.is_playing():
-                        vc.stop()
-                except Exception:
-                    pass
-                await vc.disconnect()
-            task = self._voice_timeout_tasks.pop(guild_id, None)
-            if task:
-                task.cancel()
-            self._voice_text_channels.pop(guild_id, None)
-            self._voice_sources.pop(guild_id, None)
+        from plugins.platforms.discord.voice_streaming_input import leave_voice_channel
+        await leave_voice_channel(self, guild_id)
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play audio in the VC: via the mixer (layered over the ambient bed, ducking it)
@@ -4000,86 +4001,23 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     _KEEPALIVE_INTERVAL = 15
 
     def discard_pending_voice_input(self, guild_id: int) -> None:
-        """Drop speech the receiver holds but has not emitted, before the text binding moves: audio
-        captured for the old conversation must never be stamped with the new one (#130311)."""
+        """Invalidate the old source generation before its conversation binding moves."""
+        ingress = getattr(self, "_voice_live_ingress", {}).get(guild_id)
+        if ingress is not None:
+            ingress.invalidate()
         receiver = self._voice_receivers.get(guild_id)
         if receiver is not None:
             receiver.discard_pending()
 
     async def _voice_listen_loop(self, guild_id: int):
-        """Periodically check for completed utterances and process them."""
-        receiver = self._voice_receivers.get(guild_id)
-        if not receiver:
-            return
-        last_keepalive = time.monotonic()
-        try:
-            while receiver._running:
-                await asyncio.sleep(0.2)
-                now = time.monotonic()
-                if now - last_keepalive >= self._KEEPALIVE_INTERVAL:
-                    last_keepalive = now
-                    try:
-                        vc = self._voice_clients.get(guild_id)
-                        if vc and vc.is_connected():
-                            vc._connection.send_packet(b'\xf8\xff\xfe')
-                    except Exception:
-                        pass
-                completed = receiver.check_silence()
-                # Each utterance keeps the binding it was collected under, not one set during an earlier STT.
-                captured_for = self._voice_text_channels.get(guild_id)
-                # Pass guild so role checks stay guild-scoped.
-                _vc_guild = self._client.get_guild(guild_id) if self._client is not None else None
-                for user_id, pcm_data in completed:
-                    if not self._is_allowed_user(str(user_id), guild=_vc_guild, is_dm=False):
-                        continue
-                    # User speech is activity too; keeps active listeners connected.
-                    self._reset_voice_timeout(guild_id)
-                    await self._process_voice_input(guild_id, user_id, pcm_data, captured_for)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error("Voice listen loop error: %s", e, exc_info=True)
+        from plugins.platforms.discord.voice_streaming_input import voice_listen_loop
+        await voice_listen_loop(self, guild_id)
 
-    async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes, captured_for: int | None):
-        """Convert PCM -> WAV -> STT -> callback; dropped if the binding moved off *captured_for* during STT."""
-        from tools.voice_mode_transcript import is_whisper_hallucination
-        tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
-        wav_path = tmp_f.name
-        tmp_f.close()
-        try:
-            await asyncio.to_thread(VoiceReceiver.pcm_to_wav, pcm_data, wav_path)
-            from tools.transcription_tools import transcribe_audio
-            result = await asyncio.to_thread(transcribe_audio, wav_path)
-            if not result.get("success"):
-                return
-            transcript = result.get("transcript", "").strip()
-            if not transcript or is_whisper_hallucination(transcript):
-                return
-            logger.info("Voice input from user %d: %s", user_id, transcript[:100])
-            if getattr(self, "_voice_text_channels", {}).get(guild_id) != captured_for:
-                logger.info("Dropping voice input from user %d: binding moved during transcription", user_id)
-                return
-            if self._voice_input_callback:
-                await self._voice_input_callback(
-                    guild_id=guild_id, user_id=user_id, transcript=transcript,
-                )
-        except Exception as e:
-            # Surface ffmpeg's captured stderr from CalledProcessError, else log just says "exit status N".
-            _ff_err = getattr(e, "stderr", None)
-            if _ff_err:
-                if isinstance(_ff_err, bytes):
-                    _ff_err = _ff_err.decode("utf-8", "replace")
-                logger.warning(
-                    "Voice input processing failed: %s (ffmpeg: %s)",
-                    e, _ff_err.strip(), exc_info=True,
-                )
-            else:
-                logger.warning("Voice input processing failed: %s", e, exc_info=True)
-        finally:
-            try:
-                os.unlink(wav_path)
-            except OSError:
-                pass
+    async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes,
+                                   captured_for: int | None, *, stream_result=None, source_guard=None):
+        from plugins.platforms.discord.voice_streaming_input import process_voice_input
+        await process_voice_input(self, guild_id, user_id, pcm_data, captured_for,
+                                  stream_result=stream_result, source_guard=source_guard)
 
     def _discord_channel_ids_allowed(self, channel_ids: set[str]) -> bool:
         """True when *channel_ids* intersect ``DISCORD_ALLOWED_CHANNELS``."""

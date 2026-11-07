@@ -303,10 +303,12 @@ class GatewayVoiceMixin:
         return source
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str, *, adapter=None
+        self, guild_id: int, user_id: int, transcript: str, *, adapter=None, source_is_current=None
     ):
         """Handle transcribed voice from a voice channel. ``adapter`` captured the audio; under
         multiplexing each profile's bot dispatches through its own adapter, never the default's."""
+        if source_is_current is not None and not source_is_current():
+            return
         if adapter is None:
             adapter = self.adapters.get(Platform.DISCORD)
         text_ch_id = adapter._voice_text_channels.get(guild_id) if adapter else None
@@ -366,7 +368,8 @@ class GatewayVoiceMixin:
             source=source, text=transcript, message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
             channel_prompt=channel_prompt, auto_skill=auto_skill)
-        await adapter.handle_message(event)
+        if source_is_current is None or source_is_current():
+            await adapter.handle_message(event)
 
     def _should_send_voice_reply(
         self, event: MessageEvent, response: str, agent_messages: list, already_sent: bool = False
