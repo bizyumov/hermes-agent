@@ -493,8 +493,9 @@ class TestVoiceChannelCommands:
         result = await runner._handle_voice_channel_join(event)
         assert "General" in result
         assert runner._voice_mode["discord:123"] == "all"
-        assert mock_adapter._voice_sources[111]["chat_id"] == "123"
-        assert mock_adapter._voice_sources[111]["chat_type"] == "group"
+        mock_adapter.join_voice_channel.assert_awaited_once_with(
+            mock_channel, text_channel_id=123, source=event.source.to_dict(),
+        )
 
 
     @pytest.mark.asyncio
