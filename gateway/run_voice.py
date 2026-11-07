@@ -167,7 +167,10 @@ class GatewayVoiceMixin:
             adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
                 self._voice_key(Platform.DISCORD, str(chat_id), profile=voice_profile), "off")
         try:
-            success = await adapter.join_voice_channel(voice_channel)
+            success = await adapter.join_voice_channel(
+                voice_channel, text_channel_id=int(event.source.chat_id),
+                source=event.source.to_dict(),
+            )
         except Exception as e:
             logger.warning("Failed to join voice channel: %s", e)
             adapter._voice_input_callback = None
@@ -177,15 +180,6 @@ class GatewayVoiceMixin:
         if not success:
             adapter._voice_input_callback = None
             return t("gateway.voice.channel_join_permissions")
-        text_channel_id = int(event.source.chat_id)
-        # Moving to another text channel drops speech buffered for the old one (a same-channel rejoin
-        # keeps it); nothing awaits between this and the binding write, so no poll sees the gap.
-        previous = adapter._voice_text_channels.get(guild_id)
-        if previous is not None and previous != text_channel_id and hasattr(adapter, "discard_pending_voice_input"):
-            adapter.discard_pending_voice_input(guild_id)
-        adapter._voice_text_channels[guild_id] = text_channel_id
-        if hasattr(adapter, "_voice_sources"):
-            adapter._voice_sources[guild_id] = event.source.to_dict()
         self._apply_voice_mode(adapter, self._voice_key_for_source(event.source),
                                event.source.chat_id, "all")
         return t("gateway.voice.channel_joined", name=voice_channel.name)
@@ -303,10 +297,12 @@ class GatewayVoiceMixin:
         return source
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str, *, adapter=None
+        self, guild_id: int, user_id: int, transcript: str, *, adapter=None, source_is_current=None
     ):
         """Handle transcribed voice from a voice channel. ``adapter`` captured the audio; under
         multiplexing each profile's bot dispatches through its own adapter, never the default's."""
+        if source_is_current is not None and not source_is_current():
+            return
         if adapter is None:
             adapter = self.adapters.get(Platform.DISCORD)
         text_ch_id = adapter._voice_text_channels.get(guild_id) if adapter else None
@@ -366,7 +362,8 @@ class GatewayVoiceMixin:
             source=source, text=transcript, message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
             channel_prompt=channel_prompt, auto_skill=auto_skill)
-        await adapter.handle_message(event)
+        if source_is_current is None or source_is_current():
+            await adapter.handle_message(event)
 
     def _should_send_voice_reply(
         self, event: MessageEvent, response: str, agent_messages: list, already_sent: bool = False

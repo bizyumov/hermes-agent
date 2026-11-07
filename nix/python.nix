@@ -74,6 +74,12 @@ let
           cffi = [ ];
         };
       });
+      # The Git-pinned truststore also has no recorded build backend in uv.lock.
+      truststore = prev.truststore.overrideAttrs (old: {
+        nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ final.resolveBuildSystem {
+          flit-core = [ ];
+        };
+      });
       # [kittentts] locks misaki as a git source. uv.lock records no build
       # backend for it, so supply the hatchling its pyproject declares.
       misaki = prev.misaki.overrideAttrs (old: {

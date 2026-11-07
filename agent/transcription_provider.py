@@ -47,6 +47,26 @@ class TranscriptionProvider(CatalogProviderBase):
         """A single-use live session for one utterance (streaming-capable providers only)."""
         raise NotImplementedError(f"{self.name} does not support live streaming transcription")
 
+    @property
+    def continuous_streaming_capable(self) -> bool:
+        """Whether a separate logical capture can span utterances and server connections.
+
+        Opt-in only; existing file and short-utterance providers remain valid.
+        Audio is 16 kHz mono s16le; finalized segments are not ordinary agent input.
+        """
+        return False
+
+    def open_continuous_stream_session(
+        self, *, language: Optional[str] = None, prompt: Optional[str] = None,
+        on_event=None,
+    ) -> ContinuousTranscriptionStreamSession:
+        """Open record-only capture; EOF/finalize owns the complete final tail.
+
+        Optional event callbacks are signature-inspected by the resolver. Events retain
+        source/connection/segment identity and completion provenance supplied by the provider.
+        """
+        raise NotImplementedError(f"{self.name} does not support continuous transcription")
+
 
 class TranscriptionStreamSession(abc.ABC):
     """Live audio -> transcript for one utterance. ``push_audio`` receives 16 kHz mono s16le PCM in
@@ -63,4 +83,36 @@ class TranscriptionStreamSession(abc.ABC):
 
     def partial_transcript(self) -> str:
         """Latest non-final text, polled for live captions. Default: none."""
+        return ""
+
+    def cancel(self) -> None:
+        """Thread-safe best-effort stop; optional for legacy utterance implementations.
+
+        Live-source consumers still invalidate completion when cancellation is requested.
+        Providers with an owned RPC should override this to stop its wire and workers.
+        """
+
+
+class ContinuousTranscriptionStreamSession(abc.ABC):
+    """A logical record-only session, separate from one-utterance completion.
+
+    Missing source_sample_offset means contiguous samples. Explicit offsets are in
+    16 kHz mono source samples; a provider must report unrecoverable gaps as incomplete.
+    Segment events are preview/artifact inputs and never authorize an agent turn.
+    """
+
+    @abc.abstractmethod
+    def push_audio(self, chunk: bytes, *, source_sample_offset: Optional[int] = None) -> None:
+        """Feed source PCM from one owner with an optional absolute sample cursor."""
+
+    @abc.abstractmethod
+    def finalize(self) -> dict[str, Any]:
+        """Drain the final tail; report incomplete capture rather than false success."""
+
+    @abc.abstractmethod
+    def cancel(self) -> None:
+        """Stop only this capture and invalidate its pending events."""
+
+    def partial_transcript(self) -> str:
+        """Latest preview, never a completed ordinary input."""
         return ""

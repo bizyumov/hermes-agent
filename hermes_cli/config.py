@@ -2038,51 +2038,32 @@ def _omitted_config_paths(
     return omitted
 
 
-def _write_config_state(
-    config_path: Path, data: dict[str, Any], *, allow_omissions: bool,
-    extra_content_on_create: Optional[str] = None,
-) -> None:
-    """Shared comment-preserving config writer; omission policy is selected by the public wrapper."""
-    from utils import atomic_roundtrip_yaml_save
-
-    _refuse_failed_read(config_path, data)
-    if not allow_omissions:
-        existing = require_readable_config_before_write(config_path)
-        omitted = _omitted_config_paths(existing, data)
-        if omitted:
-            shown = ", ".join(omitted[:12])
-            if len(omitted) > 12:
-                shown += f", +{len(omitted) - 12} more"
-            exc = ValueError(f"omitted config paths: {shown}")
-            raise _refuse_overwrite(
-                config_path,
-                "would lose settings omitted by this write",
-                exc,
-                "Pass the complete current config, or use atomic_config_replace() only when "
-                "deletion by omission is deliberate.",
-            ) from exc
-    atomic_roundtrip_yaml_save(config_path, data, extra_content_on_create=extra_content_on_create)
-
-
 def atomic_config_write(
     config_path: Path, data: dict[str, Any], *, extra_content_on_create: Optional[str] = None,
+    expected_state: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Persist config without allowing an incomplete mapping to delete existing settings.
+    """Persist a complete config without silently omitting existing mapping paths.
 
-    Values explicitly present in *data* may change, but every existing mapping path must remain.
-    Use ``atomic_config_replace`` for a deliberate full-state replacement where omitted keys are
-    meant to be deleted. Both paths retain the unreadable-file guard and ruamel comment preservation.
+    An optional expected raw state is checked inside the shared native write transaction.
+    Use atomic_config_replace for deliberate deletions. Comments and read guards are retained.
     """
-    _write_config_state(
-        config_path, data, allow_omissions=False, extra_content_on_create=extra_content_on_create)
+    from hermes_cli.config_file_writer import write_config_state
+
+    write_config_state(
+        config_path, data, allow_omissions=False,
+        extra_content_on_create=extra_content_on_create, expected_state=expected_state)
 
 
 def atomic_config_replace(
     config_path: Path, data: dict[str, Any], *, extra_content_on_create: Optional[str] = None,
+    expected_state: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Persist the complete desired config state; omitted mapping keys are deliberately deleted."""
-    _write_config_state(
-        config_path, data, allow_omissions=True, extra_content_on_create=extra_content_on_create)
+    """Replace full config state; validate an optional preimage in the native transaction."""
+    from hermes_cli.config_file_writer import write_config_state
+
+    write_config_state(
+        config_path, data, allow_omissions=True,
+        extra_content_on_create=extra_content_on_create, expected_state=expected_state)
 
 
 def load_config() -> dict[str, Any]:

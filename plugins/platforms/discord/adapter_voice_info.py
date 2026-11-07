@@ -28,6 +28,10 @@ class DiscordVoiceInfoMixin:
             self._voice_text_channels[guild_id] = text_channel_id
         if source is not None:
             self._voice_sources[guild_id] = source
+        ingress = getattr(self, "_voice_live_ingress", {}).get(guild_id)
+        if ingress is not None:
+            ingress.rebind()
+
 
     def get_voice_channel_info(self, guild_id: int) -> Optional[dict[str, Any]]:
         """Return voice channel info (name, members, count, speaking user IDs) or None if not connected."""
