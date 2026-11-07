@@ -21,6 +21,8 @@ _END = object()
 _MAX_FRAME_BYTES = 23040  # Maximum 120 ms of 48 kHz stereo s16le.
 _QUEUE_FRAMES = 128
 _MAX_SOURCES = 8
+_MAX_SILENCE_SAMPLES = 48000 * 5
+_MAX_TIMELINE_SAMPLES = 48000 * 240  # Short-session delivery budget, including DTX silence.
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,18 @@ class PCMFrame:
     sequence: int
     timestamp: int
     arrived_at: float
+
+
+def _silence_before(previous, frame: PCMFrame):
+    """RFC 3551 §4.1: consecutive packets can skip suppressed silence."""
+    if previous is None:
+        return 0
+    sequence, timestamp, samples = previous
+    if (frame.sequence - sequence) & 0xFFFF != 1:
+        return None
+    elapsed = (frame.timestamp - timestamp) & 0xFFFFFFFF
+    silence = elapsed - samples
+    return silence if 0 <= silence <= _MAX_SILENCE_SAMPLES else None
 
 
 class _LiveSource:
@@ -45,11 +59,13 @@ class _LiveSource:
         self._error = ""
         self._previous = None
         self._delivery_start = None
+        self._sent_samples = 0
         self._carry = b""
         self._partial = ""
         self.stats = {
             "source_id": uuid.uuid4().hex, "ssrc": first.source_id[0],
             "source_generation": first.source_id[1], "frames": 0, "input_bytes": 0,
+            "silence_samples": 0, "timeline_samples": 0,
             "partial_events": 0, "gap": False, "capture_gap": False, "first_sequence": first.sequence,
             "first_timestamp": first.timestamp, "first_partial_monotonic": None,
             "last_audio_monotonic": None, "capture_end_monotonic": None,
@@ -89,33 +105,49 @@ class _LiveSource:
             self._carry = b""
         return bytes(out)
 
+    def _push_pcm(self, pcm: bytes) -> bool:
+        converted = self._convert(pcm)
+        for start in range(0, len(converted), 1280):
+            chunk = converted[start:start + 1280]
+            if self._delivery_start is None:
+                self._delivery_start = time.monotonic()
+            delay = max(0.0, self._delivery_start + self._sent_samples / 16000 - time.monotonic())
+            if self._cancelled.wait(delay):
+                return False
+            self._inner.push_audio(chunk)
+            self._sent_samples += len(chunk) // 2
+        return True
+
     def _feed(self, frame: PCMFrame) -> None:
         if not frame.pcm or len(frame.pcm) % 4 or len(frame.pcm) > _MAX_FRAME_BYTES:
             self.stats["gap"] = self.stats["capture_gap"] = True
             self.cancel("invalid source PCM frame")
             return
-        if self._previous is not None:
-            previous = self._previous
-            sequence_delta = (frame.sequence - previous.sequence) & 0xFFFF
-            timestamp_delta = (frame.timestamp - previous.timestamp) & 0xFFFFFFFF
-            if sequence_delta != 1 or timestamp_delta != len(previous.pcm) // 4:
-                self.stats["gap"] = self.stats["capture_gap"] = True
-                self.cancel("source sequence or timestamp gap")
-                return
+        previous = self._previous
+        previous = None if previous is None else (
+            previous.sequence, previous.timestamp, len(previous.pcm) // 4,
+        )
+        silence = _silence_before(previous, frame)
+        if silence is None:
+            self.stats["gap"] = self.stats["capture_gap"] = True
+            self.cancel("source sequence or timestamp gap")
+            return
+        timeline = self.stats["timeline_samples"] + silence + len(frame.pcm) // 4
+        if timeline > _MAX_TIMELINE_SAMPLES:
+            self.cancel("native utterance exceeds the 240-second timeline budget")
+            return
         self._previous = frame
         self.stats["frames"] += 1
         self.stats["input_bytes"] += len(frame.pcm)
+        self.stats["silence_samples"] += silence
+        self.stats["timeline_samples"] = timeline
         self.stats["last_audio_monotonic"] = frame.arrived_at
         self.stats["last_sequence"] = frame.sequence
         self.stats["last_timestamp"] = frame.timestamp
-        converted = self._convert(frame.pcm)
-        if converted:
-            if self._delivery_start is None:
-                self._delivery_start = time.monotonic()
-            offset = (self.stats["input_bytes"] - len(frame.pcm)) / 192000
-            delay = max(0.0, self._delivery_start + offset - time.monotonic())
-            if not self._cancelled.wait(delay):
-                self._inner.push_audio(converted)
+        for offset in range(0, silence, 960):
+            if not self._push_pcm(bytes(min(960, silence - offset) * 4)):
+                return
+        self._push_pcm(frame.pcm)
 
     def _poll_partial(self) -> None:
         text = str(self._inner.partial_transcript() or "").strip()
@@ -188,25 +220,26 @@ class _Capture:
         self.binding, self.generation, self.context = binding, generation, context
         self.previous = None
         self.gap = False
-        self.frames = self.input_bytes = 0
+        self.frames = self.input_bytes = self.silence_samples = 0
         self.first_sequence, self.first_timestamp = frame.sequence, frame.timestamp
         self.last_sequence, self.last_timestamp = frame.sequence, frame.timestamp
 
     def observe(self, frame: PCMFrame) -> None:
-        if self.previous is not None:
-            sequence, timestamp, samples = self.previous
-            if ((frame.sequence - sequence) & 0xFFFF != 1
-                    or (frame.timestamp - timestamp) & 0xFFFFFFFF != samples):
-                self.gap = True
+        silence = _silence_before(self.previous, frame)
+        if silence is None:
+            self.gap = True
+            silence = 0
         if not frame.pcm or len(frame.pcm) % 4 or len(frame.pcm) > _MAX_FRAME_BYTES:
             self.gap = True
         self.previous = (frame.sequence, frame.timestamp, len(frame.pcm) // 4)
         self.frames += 1
         self.input_bytes += len(frame.pcm)
+        self.silence_samples += silence
         self.last_sequence, self.last_timestamp = frame.sequence, frame.timestamp
 
     def snapshot(self) -> dict:
         return {"captured_frames": self.frames, "captured_bytes": self.input_bytes,
+                "suppressed_silence_samples": self.silence_samples,
                 "capture_gap": self.gap, "first_sequence": self.first_sequence,
                 "first_timestamp": self.first_timestamp, "last_sequence": self.last_sequence,
                 "last_timestamp": self.last_timestamp}

@@ -517,3 +517,232 @@ async def test_inferred_legacy_ssrc_mapping_is_not_native_source_authorization(m
     ingress._drain()
     assert opened == []
     ingress.close()
+
+
+def test_receiver_adopts_server_sources_captured_during_connection(monkeypatch):
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    frames = []
+    conn = SimpleNamespace(add_socket_listener=lambda callback: None)
+    vc = SimpleNamespace(_connection=conn, _voice_capture_sources={17: 7})
+    receiver = VoiceReceiver(vc, on_pcm=frames.append)
+    monkeypatch.setattr(receiver, "_resolve_credentials", lambda connection: None)
+    monkeypatch.setattr(receiver, "_install_speaking_hook", lambda connection: None)
+    receiver.start()
+    receiver._accept_pcm(17, struct.pack("<hh", 600, -300) * 960, 1, 0)
+    assert frames[0].user_id == 7
+    assert receiver._ssrc_to_user[17] == 7
+
+
+@pytest.mark.asyncio
+async def test_suppressed_silence_preserves_native_timeline_and_raw_coverage(monkeypatch):
+    from plugins.platforms.discord import voice_streaming_input as live
+
+    inner = InnerSession()
+    monkeypatch.setattr(live, "open_native_stream_session", lambda: inner)
+    ingress = live.VoiceStreamIngress(adapter(), 1)
+    try:
+        ingress.offer(frame(1, 0))
+        ingress.offer(frame(2, 77760))
+        result = await ingress.finish_source((17, 0), 7, b"x" * 7680, 22)
+        assert result["success"] is True
+        assert result["stream_source"]["capture_gap"] is False
+        assert result["stream_source"]["input_bytes"] == 7680
+        assert result["stream_source"]["captured_bytes"] == 7680
+        assert result["stream_source"]["silence_samples"] == 76800
+        assert inner.received == (
+            struct.pack("<h", 150) * 320 + bytes(51200) + struct.pack("<h", 150) * 320
+        )
+    finally:
+        ingress.close()
+
+
+@pytest.mark.parametrize("sequence,timestamp,next_sequence,next_timestamp,complete", [
+    (10, 0, 11, 960, True),
+    (10, 0, 11, 77760, True),
+    (10, 0, 11, 240960, True),
+    (10, 0, 11, 240961, False),
+    (10, 0, 11, 0, False),
+    (10, 960, 11, 0, False),
+    (10, 0, 12, 1920, False),
+    (10, 0, 10, 0, False),
+    (65535, 4294966336, 0, 0, True),
+])
+def test_capture_distinguishes_silence_suppression_from_packet_loss(
+    sequence, timestamp, next_sequence, next_timestamp, complete,
+):
+    from plugins.platforms.discord import voice_streaming_input as live
+
+    first = frame(sequence, timestamp)
+    capture = live._Capture(first, (), 0, None)
+    capture.observe(first)
+    capture.observe(frame(next_sequence, next_timestamp))
+    assert capture.snapshot()["capture_gap"] is not complete
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", [
+    {"op": 2, "d": {}},
+    {"op": 13, "d": {"user_id": "7"}},
+    {"op": 5, "d": {"ssrc": 17, "user_id": "8"}},
+])
+async def test_protocol_revocation_retires_active_and_queued_native_audio(monkeypatch, message):
+    from plugins.platforms.discord import adapter as discord_adapter
+    from plugins.platforms.discord import voice_streaming_input as live
+
+    inner = InnerSession()
+    monkeypatch.setattr(live, "open_native_stream_session", lambda: inner)
+    ingress = live.VoiceStreamIngress(adapter(), 1)
+    connection = SimpleNamespace(hook=None, ws=SimpleNamespace(), add_socket_listener=lambda cb: None)
+    voice_client = SimpleNamespace(_connection=connection, _voice_capture_sources={17: 7})
+    receiver = discord_adapter.VoiceReceiver(
+        voice_client, on_pcm=ingress.offer, on_source_revoke=ingress.discard_source,
+        on_source_reset=ingress.invalidate,
+    )
+    monkeypatch.setattr(receiver, "_resolve_credentials", lambda conn: None)
+    receiver.start()
+    try:
+        receiver._accept_pcm(17, frame(1, 0).pcm, 1, 0)
+        ingress._drain()
+        assert await asyncio.to_thread(inner.fed.wait, 2)
+        delayed = frame(2, 960)
+        await connection.hook(connection.ws, message)
+        assert inner.cancelled.is_set()
+        assert receiver._source_epochs[17] == 1
+        assert not receiver._buffers
+        ingress.offer(delayed)
+        ingress._drain()
+        result = await ingress.finish_source((17, 0), 7, frame(1, 0).pcm, 22)
+        assert result["stale"] is True
+    finally:
+        ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_silence_padding_obeys_the_aggregate_native_timeline_limit(monkeypatch):
+    from plugins.platforms.discord import voice_streaming_input as live
+
+    inner = InnerSession()
+    monkeypatch.setattr(live, "open_native_stream_session", lambda: inner)
+    monkeypatch.setattr(live, "_MAX_TIMELINE_SAMPLES", 78719)
+    ingress = live.VoiceStreamIngress(adapter(), 1)
+    try:
+        ingress.offer(frame(1, 0))
+        ingress.offer(frame(2, 77760))
+        result = await ingress.finish_source((17, 0), 7, b"x" * 7680, 22)
+        assert result["success"] is False
+        assert "timeline budget" in result["error"]
+        assert result["stream_source"]["capture_gap"] is False
+        assert ingress.last_status["route"] == "fallback_required"
+        assert len(inner.received) <= 640
+    finally:
+        ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_silence_padding_does_not_wait_out_the_gap(monkeypatch):
+    from plugins.platforms.discord import voice_streaming_input as live
+    import time
+
+    silence_seen = threading.Event()
+
+    class ObservedSilence(InnerSession):
+        def push_audio(self, data):
+            super().push_audio(data)
+            if data and not any(data):
+                silence_seen.set()
+
+    inner = ObservedSilence()
+    monkeypatch.setattr(live, "open_native_stream_session", lambda: inner)
+    ingress = live.VoiceStreamIngress(adapter(), 1)
+    try:
+        ingress.offer(frame(1, 0))
+        ingress.offer(frame(2, 240960))
+        ingress._drain()
+        assert await asyncio.to_thread(silence_seen.wait, 2)
+        started = time.monotonic()
+        ingress._sources[(17, 0)].cancel("cancel during source silence")
+        result = await ingress.finish_source((17, 0), 7, b"x" * 7680, 22)
+        assert time.monotonic() - started < 2
+        assert result["success"] is False
+        assert result["worker_pending"] is False
+        assert inner.cancelled.is_set()
+        assert len(inner.received) < 160000
+    finally:
+        ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initially_mapped,message", [
+    (True, {"op": 2, "d": {}}),
+    (True, {"op": 13, "d": {"user_id": "7"}}),
+    (True, {"op": 5, "d": {"ssrc": 17, "user_id": "8"}}),
+    (False, {"op": 2, "d": {}}),
+    (False, {"op": 5, "d": {"ssrc": 17, "user_id": "8"}}),
+])
+async def test_packet_decoding_cannot_cross_source_revocation(monkeypatch, initially_mapped, message):
+    from nacl.secret import Aead
+    from plugins.platforms.discord import adapter as discord_adapter
+
+    entered, release = threading.Event(), threading.Event()
+    pcm = struct.pack("<hh", 600, -300) * 960
+    decoders = []
+
+    class BlockedDecoder:
+        def __init__(self):
+            decoders.append(self)
+
+        def decode(self, data):
+            entered.set()
+            assert release.wait(3)
+            return pcm
+
+    monkeypatch.setattr(discord_adapter.discord.opus, "Decoder", BlockedDecoder)
+    connection = SimpleNamespace(hook=None, ws=SimpleNamespace(), add_socket_listener=lambda cb: None)
+    receiver = discord_adapter.VoiceReceiver(SimpleNamespace(_connection=connection))
+    key = bytes(range(32))
+    receiver._creds = (key, None, 0, False)
+    receiver._running = True
+    if initially_mapped:
+        receiver.map_ssrc(17, 7)
+    receiver._install_speaking_hook(connection)
+
+    def packet(sequence):
+        header = struct.pack(">BBHII", 0x80, 0x78, sequence, (sequence - 1) * 960, 17)
+        nonce_tail = sequence.to_bytes(4, "big")
+        encrypted = Aead(key).encrypt(b"fixture-opus", header, nonce_tail + bytes(20)).ciphertext
+        return header + encrypted + nonce_tail
+
+    worker = threading.Thread(target=receiver._on_packet, args=(packet(1),))
+    worker.start()
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        await connection.hook(connection.ws, message)
+        release.set()
+        await asyncio.to_thread(worker.join, 2)
+        assert not worker.is_alive()
+        assert not any(receiver._buffers.values())
+        assert not receiver._decoders
+        receiver.map_ssrc(17, 8)
+        receiver._on_packet(packet(2))
+        assert len(decoders) == 2
+        assert receiver._decoders[17] is decoders[1]
+        assert bytes(receiver._buffers[17]) == pcm
+    finally:
+        release.set()
+        await asyncio.to_thread(worker.join, 3)
+
+
+@pytest.mark.asyncio
+async def test_long_decimal_disconnect_id_preserves_trust_and_original_hook(monkeypatch):
+    from unittest.mock import AsyncMock
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    original = AsyncMock()
+    connection = SimpleNamespace(hook=original, ws=SimpleNamespace())
+    receiver = VoiceReceiver(SimpleNamespace(_connection=connection))
+    receiver.map_ssrc(17, 7)
+    receiver._install_speaking_hook(connection)
+    await connection.hook(connection.ws, {"op": 13, "d": {"user_id": "9" * 5000}})
+    assert receiver._trusted_ssrc_users == {17: 7}
+    assert original.await_count == 1

@@ -710,7 +710,8 @@ class VoiceReceiver:
     CHANNELS = 2               # Discord sends stereo
     REKEY_FAILURE_STREAK = 25  # consecutive NaCl failures → re-resolve creds
 
-    def __init__(self, voice_client, allowed_user_ids: set | None = None, *, on_pcm=None):
+    def __init__(self, voice_client, allowed_user_ids: set | None = None, *, on_pcm=None,
+                 on_source_revoke=None, on_source_reset=None):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
         self._running = False
@@ -733,10 +734,13 @@ class VoiceReceiver:
         self._lock = threading.Lock()
         self._buffers: dict[int, bytearray] = defaultdict(bytearray)
         self._source_epochs = defaultdict(int)
+        self._source_reset_generation = 0
         self._completed_source_ids = ()
         self._discarded_source_ids = ()
         self._trusted_ssrc_users = {}
         self._on_pcm = on_pcm or (lambda frame: None)
+        self._on_source_revoke = on_source_revoke
+        self._on_source_reset = on_source_reset
         self._last_packet_time: dict[int, float] = {}
         # Opus decoder per SSRC (each user needs own decoder state)
         self._decoders: dict[int, object] = {}
@@ -760,6 +764,11 @@ class VoiceReceiver:
         """Start listening for voice packets."""
         conn = self._vc._connection
         self._resolve_credentials(conn)
+        sources = getattr(self._vc, "_voice_capture_sources", None)
+        if isinstance(sources, dict):
+            self._trusted_ssrc_users = sources
+            for ssrc, user in list(sources.items()):
+                self.map_ssrc(ssrc, user)
 
         self._install_speaking_hook(conn)
         conn.add_socket_listener(self._on_packet)
@@ -880,9 +889,9 @@ class VoiceReceiver:
     # --- SSRC -> user_id mapping via SPEAKING opcode hook ---
 
     def map_ssrc(self, ssrc: int, user_id: int):
-        with self._lock:
-            self._ssrc_to_user[ssrc] = user_id
-            self._trusted_ssrc_users[ssrc] = user_id
+        from plugins.platforms.discord.voice_capture_transport import map_receiver_source
+
+        return map_receiver_source(self, ssrc, user_id)
 
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5); ``conn.hook`` is
@@ -891,13 +900,23 @@ class VoiceReceiver:
         receiver_self = self
 
         async def wrapped_hook(ws, msg):
+            from plugins.platforms.discord.voice_capture_transport import reset_receiver_sources, revoke_receiver_user, voice_websocket_current
+
+            if not voice_websocket_current(conn, ws):
+                return
+            if isinstance(msg, dict) and msg.get("op") == 2:
+                reset_receiver_sources(receiver_self)
+            elif isinstance(msg, dict) and msg.get("op") == 13:
+                data = msg.get("d")
+                user = data.get("user_id") if isinstance(data, dict) else None
+                revoke_receiver_user(receiver_self, user)
             if isinstance(msg, dict) and msg.get("op") == 5:
-                data = msg.get("d", {})
+                data = msg.get("d")
+                data = data if isinstance(data, dict) else {}
                 ssrc = data.get("ssrc")
                 user_id = data.get("user_id")
-                if ssrc and user_id:
-                    logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
-                    receiver_self.map_ssrc(int(ssrc), int(user_id))
+                if receiver_self.map_ssrc(ssrc, user_id):
+                    logger.info("SPEAKING event: ssrc=%s -> user=%s", ssrc, user_id)
             if original_hook:
                 await original_hook(ws, msg)
             # Re-resolve decryption state after the events that change it.
@@ -956,10 +975,6 @@ class VoiceReceiver:
         if not self._running or self._paused:
             return
 
-        # One consistent credential generation for this packet — a refresh
-        # on another thread swaps the whole tuple, never half of it.
-        secret_key, dave_session, dave_pver, _dave_downgraded = self._creds
-
         # Log first few raw packets for debugging
         self._packet_debug_count += 1
         if self._packet_debug_count <= 5:
@@ -978,6 +993,10 @@ class VoiceReceiver:
         _, _, seq, _timestamp, ssrc = struct.unpack_from(">BBHII", data, 0)
         if ssrc == self._bot_ssrc:
             return
+        from plugins.platforms.discord.voice_capture_transport import capture_packet_claim, packet_claim_current
+
+        claim, credentials, user_id = capture_packet_claim(self, ssrc)
+        secret_key, dave_session, dave_pver, _dave_downgraded = credentials
         # Calculate dynamic RTP header size (RFC 9335 / rtpsize mode)
         cc = first_byte & 0x0F  # CSRC count
         has_extension = bool(first_byte & 0x10)  # extension bit
@@ -1052,7 +1071,8 @@ class VoiceReceiver:
         # --- DAVE E2EE decrypt ---
         if dave_session:
             with self._lock:
-                user_id = self._ssrc_to_user.get(ssrc, 0)
+                if not packet_claim_current(self, ssrc, claim):
+                    return
                 if not user_id:
                     # Rejoin race: SPEAKING may never be resent for a user who
                     # was already talking — try the sole-member inference
@@ -1095,23 +1115,18 @@ class VoiceReceiver:
                 return
 
         # --- Opus decode -> PCM ---
-        try:
-            if ssrc not in self._decoders:
-                self._decoders[ssrc] = discord.opus.Decoder()
-            pcm = self._decoders[ssrc].decode(decrypted)
-            self._decode_ok += 1
-            self._accept_pcm(ssrc, pcm, seq, _timestamp)
-        except Exception as e:
-            with self._lock:
-                self._decoders.pop(ssrc, None)
-            logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
-            return
+        from plugins.platforms.discord.voice_capture_transport import receive_decoded_packet
 
-    def _accept_pcm(self, ssrc: int, pcm: bytes, sequence: int, timestamp: int) -> None:
+        receive_decoded_packet(self, ssrc, decrypted, seq, _timestamp, claim, discord.opus.Decoder)
+
+    def _accept_pcm(self, ssrc: int, pcm: bytes, sequence: int, timestamp: int, *, _packet_claim=None) -> None:
         from plugins.platforms.discord.voice_streaming_input import PCMFrame
+        from plugins.platforms.discord.voice_capture_transport import packet_claim_current
 
         with self._lock:
             if not self._running or self._paused:
+                return
+            if _packet_claim is not None and not packet_claim_current(self, ssrc, _packet_claim):
                 return
             arrived_at = time.monotonic()
             self._buffers[ssrc].extend(pcm)
@@ -3827,14 +3842,17 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 self._reset_voice_timeout(guild_id)
                 self._bind_voice_text_channel(guild_id, text_channel_id, source)
                 return True
-            vc = await channel.connect()
+            from plugins.platforms.discord.voice_capture_transport import capture_voice_client_class
+
+            vc = await channel.connect(cls=capture_voice_client_class())
             self._voice_clients[guild_id] = vc
             self._reset_voice_timeout(guild_id)
             self._bind_voice_text_channel(guild_id, text_channel_id, source)
             try:
                 from plugins.platforms.discord.voice_streaming_input import VoiceStreamIngress
                 ingress = VoiceStreamIngress(self, guild_id)
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids, on_pcm=ingress.offer)
+                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids, on_pcm=ingress.offer,
+                                         on_source_revoke=ingress.discard_source, on_source_reset=ingress.invalidate)
                 self._voice_live_ingress[guild_id] = ingress
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
